@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -82,9 +82,64 @@ def build_tools() -> ResearchTools:
     return tools
 
 
-def run_ddg_search(query: str, max_results: int) -> List[Dict[str, str]]:
+def _normalize_date_str(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).isoformat()
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).isoformat()
+        except Exception:
+            continue
+    return None
+
+
+def _inject_date_filters(query: str, since_days: int = 0, date_from: Optional[str] = None, date_to: Optional[str] = None) -> str:
+    tokens = []
+    if since_days > 0 and not date_from:
+        start = (datetime.utcnow() - timedelta(days=since_days)).date().isoformat()
+        tokens.append(f"after:{start}")
+    if date_from:
+        tokens.append(f"after:{date_from}")
+    if date_to:
+        tokens.append(f"before:{date_to}")
+    if tokens:
+        # Nudge toward current coverage when recency is requested
+        tokens.append("site:news")
+    if not tokens:
+        return query
+    return f"{query} {' '.join(tokens)}"
+
+
+def run_ddg_search(
+    query: str,
+    max_results: int,
+    since_days: int = 0,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    time_limit: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    search_query = _inject_date_filters(query, since_days=since_days, date_from=date_from, date_to=date_to)
     with DDGS() as search:
-        results = list(search.text(query, max_results=max_results))
+        if time_limit:
+            results = list(
+                search.news(
+                    safesearch="off",
+                    keywords=search_query,
+                    timelimit=time_limit,
+                    max_results=max_results,
+                )
+            )
+        else:
+            results = list(search.text(search_query, max_results=max_results))
     cleaned = []
     for item in results:
         url = item.get("href") or item.get("url")
@@ -95,6 +150,12 @@ def run_ddg_search(query: str, max_results: int) -> List[Dict[str, str]]:
                 "url": url,
                 "title": item.get("title", "").strip(),
                 "snippet": item.get("body") or item.get("snippet", ""),
+                "published_at": _normalize_date_str(
+                    item.get("date")
+                    or item.get("published")
+                    or item.get("published_at")
+                    or item.get("year")
+                ),
             }
         )
     return cleaned

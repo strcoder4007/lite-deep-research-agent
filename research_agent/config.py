@@ -6,16 +6,21 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:8b-q4_K_M")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
 
 # Execution/limits
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.25"))
 SYNTH_TEMPERATURE = float(os.getenv("SYNTH_TEMPERATURE", "0.25"))
 CONCURRENCY = 1
 
 # Search/fetch settings
 SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "8"))
-FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "10"))
+FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "15"))
 SEARCH_RERANK_TOP_N = int(os.getenv("SEARCH_RERANK_TOP_N", "10"))
 SEARCH_RERANK_USE_HOST_DEDUP = os.getenv("SEARCH_RERANK_USE_HOST_DEDUP", "1") == "1"
+SEARCH_SINCE_DAYS = int(os.getenv("SEARCH_SINCE_DAYS", "0"))
+SEARCH_DATE_FROM = (os.getenv("SEARCH_DATE_FROM", "") or "").strip() or None
+SEARCH_DATE_TO = (os.getenv("SEARCH_DATE_TO", "") or "").strip() or None
+SEARCH_RECENCY_BOOST = float(os.getenv("SEARCH_RECENCY_BOOST", "0.05"))
+SEARCH_TIME_LIMIT = (os.getenv("SEARCH_TIME_LIMIT", "") or "").strip() or None
 
 # Memory/vector store
 MEMORY_DIR = Path(os.getenv("MEMORY_DIR", "advanced_memory"))

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import yaml
@@ -42,17 +43,39 @@ def _parse_plan(raw_text: str) -> Tuple[Dict[str, Any], List[str]]:
     return normalized, notes
 
 
+def _parse_date_str(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    cleaned = str(text).strip()
+    if not cleaned:
+        return None
+    try:
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1] + "+00:00"
+        return datetime.fromisoformat(cleaned)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except Exception:
+            continue
+    return None
+
+
 def plan_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
     query = state["query"]
+    today = datetime.utcnow().date().isoformat()
     messages = [
         SystemMessage(
             content=(
                 "You are a research planner. Create a concise plan for a web research agent.\n"
                 "Return ONLY structured YAML with keys SEARCH_QUERIES, KEY_ASPECTS, GAPS_TO_ADDRESS.\n"
-                "Provide 4-5 search queries, key aspects to cover, and gaps/questions to verify."
+                "Provide 4-5 search queries, key aspects to cover, and gaps/questions to verify.\n"
+                f"Current date (UTC): {today}."
             )
         ),
-        HumanMessage(content=(f"User query: {query}")),
+        HumanMessage(content=(f"User query: {query}\nCurrent date (UTC): {today}")),
     ]
     raw = tools.llm.invoke(messages).content
     plan, notes = _parse_plan(raw)
@@ -99,10 +122,18 @@ def _rerank_results(
         texts = [f"{c.get('title','')} {c.get('snippet','')}" for c in candidates]
         doc_embs = tools.embedder.embed_documents(texts)
         scored = []
+        now = datetime.utcnow()
         for cand, emb in zip(candidates, doc_embs):
             score = cosine_similarity(q_emb, emb)
             cand_copy = dict(cand)
-            cand_copy["score"] = score
+            recency_bonus = 0.0
+            published_at = cand_copy.get("published_at")
+            if published_at:
+                dt = _parse_date_str(published_at)
+                if dt:
+                    age_days = max((now - dt).total_seconds() / 86400.0, 0.1)
+                    recency_bonus = config.SEARCH_RECENCY_BOOST / (1.0 + age_days / 7.0)
+            cand_copy["score"] = score + recency_bonus
             scored.append(cand_copy)
         scored.sort(key=lambda x: x.get("score", 0), reverse=True)
         return scored[: config.SEARCH_RERANK_TOP_N]
@@ -115,7 +146,14 @@ def search_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
     query = state["query"]
     all_results: List[Dict[str, str]] = []
     for sq in state.get("search_queries", []):
-        results = run_ddg_search(sq, max_results=config.SEARCH_RESULTS_PER_QUERY)
+        results = run_ddg_search(
+            sq,
+            max_results=config.SEARCH_RESULTS_PER_QUERY,
+            since_days=config.SEARCH_SINCE_DAYS,
+            date_from=config.SEARCH_DATE_FROM,
+            date_to=config.SEARCH_DATE_TO,
+            time_limit=config.SEARCH_TIME_LIMIT,
+        )
         for r in results:
             r["query"] = sq
         all_results.extend(results)

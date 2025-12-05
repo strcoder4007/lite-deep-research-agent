@@ -8,9 +8,7 @@ from .agent import AdvancedResearchAgent
 
 
 EXAMPLE_QUERIES = [
-    "How are drought conditions evolving in California in 2024 and what mitigation steps are being taken?",
-    "What are the latest techniques for reducing LLM hallucinations with grounding?",
-    "State of small modular reactor deployments globally in 2024",
+    "What are the new open source llms released in the last 30 days?",
     "Tell me about the new toyota GR GT, epxected price, release date, specs"
 ]
 
@@ -47,7 +45,9 @@ def main() -> int:
     for src in result.get("sources", []):
         print(f"- {src}")
     digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
-    path = Path(f"report_{digest}.txt")
+    reports_dir = Path("reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    path = reports_dir / f"report_{digest}.txt"
     path.write_text(report)
     print(f"\nSaved report to {path}")
     return 0

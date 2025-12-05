@@ -135,6 +135,11 @@ GAPS_TO_ADDRESS:
 - Keep synthesis grounded with low temperature and structured output plus inline source markers.
 - Keep `should_continue` enabled to loop when coverage is thin or gaps remain.
 
+## Future improvements
+- Human-in-the-loop checkpoints for query refinement, source approval, and draft review.
+- Improve DuckDuckGo integrations (news timelimits, richer metadata, better dedupe).
+- Use a cross-encoder reranker to re-score top candidates before truncation.
+
 ## Agent wrapper (`AdvancedResearchAgent`)
 - Builds the graph with `create_research_graph()`.
 - `research(query, max_iterations, verbose=True)` returns `{query, report, sources, plan, message_log, errors}` with console progress when verbose.

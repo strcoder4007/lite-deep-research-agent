@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -29,11 +30,33 @@ class AdvancedResearchAgent:
         }
         append_message(initial_state, f"Starting research for: {query}")
         latest_state = dict(initial_state)
+        last_time = time.perf_counter()
+
+        def _log_node(name: str, payload: Dict[str, Any], elapsed: float) -> None:
+            duration_ms = elapsed * 1000.0
+            summary_parts = []
+            if payload.get("search_results"):
+                summary_parts.append(f"results={len(payload['search_results'])}")
+            if payload.get("fetched_content"):
+                summary_parts.append(f"fetched={len(payload['fetched_content'])}")
+            if payload.get("extracted_facts"):
+                summary_parts.append(f"facts={len(payload['extracted_facts'])}")
+            if payload.get("relevant_memory"):
+                summary_parts.append(f"memory={len(payload['relevant_memory'])}")
+            if payload.get("sources"):
+                summary_parts.append(f"sources={len(payload['sources'])}")
+            if payload.get("errors"):
+                summary_parts.append(f"errors={len(payload['errors'])}")
+            summary = " | ".join(summary_parts) if summary_parts else ""
+            print(f"[{name:<15}] {duration_ms:7.1f} ms" + (f" | {summary}" if summary else ""))
+
         for event in self.graph.stream(initial_state):
             for node, data in event.items():
                 latest_state = {**latest_state, **data}
                 if verbose:
-                    print(f"[{node}]")
+                    now = time.perf_counter()
+                    _log_node(node, data, now - last_time)
+                    last_time = now
         final_state = latest_state
         return {
             "query": query,
