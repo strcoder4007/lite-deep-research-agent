@@ -1,0 +1,20 @@
+{
+  "dependencies": [
+    "langgraph",
+    "langchain",
+    "langchain-text-splitters",
+    "langchain-community",
+    "langchain-ollama",
+    "langchain-chroma",
+    "ddgs",
+    "beautifulsoup4",
+    "requests",
+    "chromadb",
+    "numpy",
+    "pyyaml"
+  ],
+  "graphs": {
+    "advanced_research": "research_agent.graph:get_graph"
+  },
+  "env": "./.env"
+}

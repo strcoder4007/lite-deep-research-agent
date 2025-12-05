@@ -1,0 +1,12 @@
+langgraph
+langchain
+langchain-text-splitters
+langchain-community
+langchain-ollama
+langchain-chroma
+ddgs
+beautifulsoup4
+requests
+chromadb
+numpy
+pyyaml
