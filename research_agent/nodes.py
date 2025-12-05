@@ -69,9 +69,12 @@ def plan_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
     messages = [
         SystemMessage(
             content=(
-                "You are a research planner. Create a concise plan for a web research agent.\n"
-                "Return ONLY structured YAML with keys SEARCH_QUERIES, KEY_ASPECTS, GAPS_TO_ADDRESS.\n"
-                "Provide 4-5 search queries, key aspects to cover, and gaps/questions to verify.\n"
+                "You are a focused research planner for a web research agent.\n"
+                "Output strictly YAML with keys SEARCH_QUERIES, KEY_ASPECTS, GAPS_TO_ADDRESS (no prose, no code fences).\n"
+                "- SEARCH_QUERIES: 4-5 diverse, specific web search queries (avoid duplicates, keep concise).\n"
+                "- KEY_ASPECTS: what to cover to answer the user fully.\n"
+                "- GAPS_TO_ADDRESS: uncertainties or checks needed; leave empty if none.\n"
+                "Be concrete, avoid filler words, and keep total output brief.\n"
                 f"Current date (UTC): {today}."
             )
         ),
@@ -192,15 +195,19 @@ def analyze_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
         prompt = [
             SystemMessage(
                 content=_with_no_think(
-                    "Extract concise, factual statements relevant to the user query. "
-                    "Prefix with source title in brackets. Keep it short."
+                    "Extract only grounded, concise facts that answer the user query.\n"
+                    "- Return bullet-style lines, one fact per line.\n"
+                    "- Start each fact with the source title in brackets, e.g., [Title] fact...\n"
+                    "- Use exact numbers/names from the text; no speculation or opinions.\n"
+                    "- Skip content that is off-topic or redundant.\n"
                 )
             ),
             HumanMessage(
                 content=_with_no_think(
                     f"User query: {query}\n"
                     f"Source: {doc['title']}\n"
-                    f"Content:\n{snippet}"
+                    "From the content below, pull only the most relevant facts (ignore the rest):\n"
+                    f"{snippet}"
                 )
             ),
         ]
@@ -243,10 +250,11 @@ def synthesize_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any
     prompt = [
         SystemMessage(
             content=(
-                "You are a research synthesis assistant. Write a grounded report using ONLY the provided facts "
-                "and memory notes. Do not speculate. Include inline source markers like [Source 1].\n"
-                "Structure: Executive Summary; Numbered Findings; Analysis; Conclusion; Notes.\n"
-                "Temperature low. Keep concise."
+                "You are a research synthesis assistant. Write a concise, grounded report using ONLY the provided facts "
+                "and memory notes. Do not invent information.\n"
+                "- Include inline source markers like [Source 1], [Source 2] that map to the supplied Sources list.\n"
+                "- Structure: Executive Summary; Numbered Findings; Analysis; Conclusion; Notes (if any gaps/uncertainty, state them).\n"
+                "- Keep temperature low and wording crisp."
             )
         ),
         HumanMessage(

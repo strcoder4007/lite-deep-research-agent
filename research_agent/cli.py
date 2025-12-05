@@ -8,7 +8,7 @@ from .agent import AdvancedResearchAgent
 
 
 EXAMPLE_QUERIES = [
-    "What are the new open source llms released in the last 30 days?",
+    "What are the new open source llms released?",
     "Tell me about the new toyota GR GT, epxected price, release date, specs"
 ]
 

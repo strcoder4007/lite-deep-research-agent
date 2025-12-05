@@ -33,7 +33,7 @@ class AdvancedResearchAgent:
         last_time = time.perf_counter()
 
         def _log_node(name: str, payload: Dict[str, Any], elapsed: float) -> None:
-            duration_ms = elapsed * 1000.0
+            duration_ms = elapsed
             summary_parts = []
             if payload.get("search_results"):
                 summary_parts.append(f"results={len(payload['search_results'])}")
@@ -48,7 +48,7 @@ class AdvancedResearchAgent:
             if payload.get("errors"):
                 summary_parts.append(f"errors={len(payload['errors'])}")
             summary = " | ".join(summary_parts) if summary_parts else ""
-            print(f"[{name:<15}] {duration_ms:7.1f} ms" + (f" | {summary}" if summary else ""))
+            print(f"[{name:<15}] {duration_ms:7.1f} seconds" + (f" | {summary}" if summary else ""))
 
         for event in self.graph.stream(initial_state):
             for node, data in event.items():

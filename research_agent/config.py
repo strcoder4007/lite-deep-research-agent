@@ -6,7 +6,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:8b-q4_K_M")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
 
 # Execution/limits
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1000"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.25"))
 SYNTH_TEMPERATURE = float(os.getenv("SYNTH_TEMPERATURE", "0.25"))
 CONCURRENCY = 1
