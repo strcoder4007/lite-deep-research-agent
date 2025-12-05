@@ -1,1 +1,5 @@
 .env
+advanced_memory
+.vscode
+__pycache__
+venv
