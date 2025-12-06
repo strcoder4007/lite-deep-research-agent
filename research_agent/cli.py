@@ -4,6 +4,13 @@ import hashlib
 import sys
 from pathlib import Path
 
+try:  # load environment variables from .env if present
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 from .agent import AdvancedResearchAgent
 
 

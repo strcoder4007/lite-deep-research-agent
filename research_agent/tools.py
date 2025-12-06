@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
+from langsmith import traceable
 try:  # prefer new package name
     from ddgs import DDGS
 except ImportError:  # fallback to legacy package
@@ -119,6 +120,7 @@ def _inject_date_filters(query: str, since_days: int = 0, date_from: Optional[st
     return f"{query} {' '.join(tokens)}"
 
 
+@traceable(run_type="tool", name="DuckDuckGo Search")
 def run_ddg_search(
     query: str,
     max_results: int,
@@ -161,6 +163,7 @@ def run_ddg_search(
     return cleaned
 
 
+@traceable(run_type="retriever", name="Fetch URL")
 def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple[str, str]]:
     headers = {
         "User-Agent": "lite-research-agent/0.1 (+https://github.com/)",

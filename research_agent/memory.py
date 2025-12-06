@@ -23,7 +23,8 @@ def add_to_memory(
     if not docs:
         return []
     tools.vectorstore.add_documents(docs)
-    tools.vectorstore.persist()
+    if hasattr(tools.vectorstore, "persist"):
+        tools.vectorstore.persist()
     return docs
 
 

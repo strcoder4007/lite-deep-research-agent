@@ -28,6 +28,7 @@ class AdvancedResearchAgent:
             "errors": [],
             "search_queries": [],
         }
+        run_id = hashlib.sha1(query.encode("utf-8")).hexdigest()[:8]
         append_message(initial_state, f"Starting research for: {query}")
         latest_state = dict(initial_state)
         last_time = time.perf_counter()
@@ -50,7 +51,12 @@ class AdvancedResearchAgent:
             summary = " | ".join(summary_parts) if summary_parts else ""
             print(f"[{name:<15}] {duration_ms:7.1f} seconds" + (f" | {summary}" if summary else ""))
 
-        for event in self.graph.stream(initial_state):
+        stream_config = {
+            "configurable": {"thread_id": run_id},
+            "metadata": {"query": query},
+        }
+
+        for event in self.graph.stream(initial_state, config=stream_config):
             for node, data in event.items():
                 latest_state = {**latest_state, **data}
                 if verbose:
