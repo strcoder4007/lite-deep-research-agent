@@ -5,8 +5,9 @@ Local web research agent built with LangGraph. It plans, searches, fetches, extr
 > This README is the source of truth for architecture, implementation progress, and usage.
 
 ## Setup
-- Install dependencies: `pip install -r requirements.txt`
-- Copy `.env` (or edit) to set model names and limits; defaults target a 16 GB VRAM box.
+- Install dependencies: `pip install -r requirements.txt` (includes `langsmith` + `python-dotenv` for tracing).
+- Edit `.env` to set model names/limits; defaults target a 16 GB VRAM box. The CLI auto-loads `.env` on startup.
+- Set LangSmith env vars in `.env` if you want tracing: `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY=<key>`, optional `LANGSMITH_PROJECT=lite-deep-research-agent` and `LANGSMITH_WORKSPACE_ID=<id>`.
 - Run an Ollama server with small models available (defaults: `qwen3:8b-q4_K_M` for LLM, `mxbai-embed-large` for embeddings). Override with `LLM_MODEL`/`EMBED_MODEL` env vars.
 - Vector memory persists to `./advanced_memory`; keep this directory to reuse historical context.
 
@@ -17,6 +18,11 @@ python -m research_agent  # interactive REPL
 python -m research_agent.cli
 ```
 Reports are saved to `report_<hash>.txt` and include sources.
+
+### Tracing (LangSmith)
+- With `.env` populated and `LANGSMITH_TRACING=true`, runs automatically emit LangGraph/LangChain traces (per-node spans plus DuckDuckGo search/fetch spans).
+- The agent sets a stable `thread_id` per query and attaches the query as metadata for grouping in LangSmith.
+- If traces don’t appear, confirm env vars are loaded: `python - <<'PY'\nimport os; print(os.getenv('LANGSMITH_API_KEY'), os.getenv('LANGSMITH_TRACING'))\nPY`.
 
 ## LangGraph application structure
 The repo follows the layout described in the LangGraph docs: a package that holds all graph code, a dependency file, a `langgraph.json`, and an optional `.env`.
