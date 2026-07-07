@@ -10,11 +10,11 @@ The orchestrator uses **LLM-driven decomposition and iteration control**. Sub-ag
 
 | Goal | How |
 |---|---|
-| **Lightweight** | 4B model via vLLM, 137MB embeddings, zero cloud dependencies |
+| **Lightweight** | 4B model via Ollama, 137MB embeddings, zero cloud dependencies |
 | **Parallel by default** | LangGraph `Send` fan-out spawns N sub-agents concurrently |
 | **LLM-driven iteration** | Orchestrator decides when coverage is sufficient; generates follow-up sub-tasks |
 | **Grounded output** | Every fact traced to a source URL; per-topic memory enriches context |
-| **Single GPU** | vLLM serves both LLM and embeddings under 16GB VRAM total |
+| **Single GPU** | Ollama serves both LLM and embeddings under 16GB unified memory total |
 
 ---
 
@@ -134,30 +134,18 @@ Fields without a reducer (like `final_answer`, `next_step`, `aggregated_facts`) 
 
 ## 4. Component Design
 
-### 4.1 LLM: qwen3.5:4b via vLLM
+### 4.1 LLM: qwen3.5:4b via Ollama
 
 | Property | Value |
 |---|---|
-| Model | `cyankiwi/Qwen3.5-4B-AWQ-4bit` |
-| Context window | 256K tokens |
-| VRAM | ~2.5GB (AWQ-4bit) |
-| Server | vLLM OpenAI-compatible API (`localhost:8000`) |
-| Structured output | `guided_json` via vLLM's native support |
-| LangChain client | `langchain_openai.ChatOpenAI(base_url=...)` |
+| Model | `qwen3.5:4b` |
+| Context window | 262144 (256K) via `num_ctx` |
+| Memory | ~4GB (Q4_K_M quantization) |
+| Server | Ollama (`localhost:11434`) |
+| Structured output | `json_mode` / `function_calling` via `with_structured_output()` |
+| LangChain client | `langchain_ollama.ChatOllama(model=..., num_ctx=262144)` |
 
-**Concurrency model:** vLLM uses continuous batching. When N sub-agents make concurrent LLM calls (planning, fact extraction), vLLM batches them into a single forward pass. This is the primary reason to use vLLM over Ollama — Ollama queues requests, vLLM parallelizes them.
-
-### 4.2 Embeddings: nomic-embed-text via vLLM
-
-| Property | Value |
-|---|---|
-| Model | `nomic-ai/nomic-embed-text-v1.5` |
-| Dimensions | 768 |
-| VRAM | ~275MB |
-| Server | Separate vLLM instance (`localhost:8001`) with `--task embedding` |
-| LangChain client | `langchain_openai.OpenAIEmbeddings(base_url=...)` |
-
-Both servers run on the same GPU. vLLM's PagedAttention memory management allows them to coexist under the 16GB budget.
+**Concurrency model:** Ollama processes requests sequentially. For parallel sub-agents, the orchestrator uses `ThreadPoolExecutor` with `asyncio.to_thread()` for I/O-bound search/fetch work, while LLM calls are naturally serialized per graph stage. This is sufficient since the graph structure (plan → fan-out → aggregate → synthesize) limits concurrent LLM calls to the fan-out phase.
 
 ### 4.3 Search: DuckDuckGo + s.jina.ai
 
@@ -467,88 +455,97 @@ User query
 
 ---
 
-## 7. vLLM Integration
+## 7. Ollama Integration
 
 ### Setup
 
 ```bash
 # One-time install
-pip install vllm
+pip install -r requirements.txt
 
-# Pull models
-huggingface-cli download cyankiwi/Qwen3.5-4B-AWQ-4bit
-huggingface-cli download nomic-ai/nomic-embed-text-v1.5
+# Pull models (requires Ollama running: ollama serve)
+ollama pull qwen3.5:4b
+ollama pull nomic-embed-text
 ```
 
-### Server Launch
+### Model Config (Modelfile for 256K context)
 
-```bash
-# LLM server (port 8000)
-vllm serve cyankiwi/Qwen3.5-4B-AWQ-4bit \
-    --port 8000 \
-    --max-model-len 32768 \
-    --gpu-memory-utilization 0.80 \
-    --enable-auto-tool-choice \
-    --tool-call-parser hermes
-
-# Embeddings server (port 8001)
-vllm serve nomic-ai/nomic-embed-text-v1.5 \
-    --port 8001 \
-    --task embedding \
-    --gpu-memory-utilization 0.15
+```dockerfile
+# Modelfile.qwen3.5-4b
+FROM qwen3.5:4b
+PARAMETER num_ctx 262144
+PARAMETER temperature 0.25
+PARAMETER num_thread 4
 ```
 
-**VRAM budget** (16GB GPU):
-- LLM (`qwen3.5:4b` AWQ-4bit): ~2.5GB
-- Embeddings (`nomic-embed-text`): ~1GB
-- KV cache overhead: ~4GB
-- **Total: ~7.5GB** — fits under 16GB with generous headroom
+Apply with: `ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b`
 
-### CLI Flags
+### Memory Budget (Mac Unified Memory)
 
-```bash
-# Auto-launch vLLM servers as subprocesses
-python -m research_agent --start-vllm
-
-# Connect to already-running servers
-python -m research_agent --llm-url http://localhost:8000/v1 --embed-url http://localhost:8001/v1
-```
-
-The `--start-vllm` flag launches both vLLM servers as subprocesses, waits for them to be healthy (health-check loop on `/v1/models`), runs the agent, and tears down the servers on exit. This is optional — the default mode expects vLLM to already be running.
+| Component | Estimate |
+|---|---|
+| LLM weights (Q4_K_M, 4B) | ~3.5GB |
+| KV cache (256K context, fp16) | ~2.5GB |
+| Embeddings (`nomic-embed-text`) | ~0.5GB |
+| System + overhead | ~2GB |
+| **Total** | **~8.5GB** — fits in 16GB unified memory with headroom |
 
 ### Client Code
 
 ```python
 # research_agent/llm.py
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-def create_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=config.LLM_MODEL_NAME,
-        base_url=config.LLM_BASE_URL,      # http://localhost:8000/v1
+def create_llm() -> ChatOllama:
+    return ChatOllama(
+        model=config.LLM_MODEL,          # "qwen3.5:4b" or "qwen3.5-4b-256k"
+        base_url=config.OLLAMA_BASE_URL,  # http://localhost:11434
         temperature=config.LLM_TEMPERATURE,
-        max_tokens=config.LLM_MAX_TOKENS,
-        api_key="not-needed",              # vLLM doesn't require auth locally
+        num_ctx=config.LLM_NUM_CTX,       # 262144
+        num_thread=4,
     )
 
-def create_embedder() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(
-        model=config.EMBED_MODEL_NAME,
-        base_url=config.EMBED_BASE_URL,    # http://localhost:8001/v1
-        api_key="not-needed",
+def create_embedder() -> OllamaEmbeddings:
+    return OllamaEmbeddings(
+        model=config.EMBED_MODEL,         # "nomic-embed-text"
+        base_url=config.OLLAMA_BASE_URL,
     )
 ```
 
-### Structured Output with vLLM
+### Server Launch
 
-vLLM supports `guided_json` natively. LangChain's `ChatOpenAI.with_structured_output()` sends a `response_format` with JSON Schema, which vLLM handles via its `--enable-auto-tool-choice` flag:
+Ollama runs as a single server on port 11434:
 
-```python
-class PlanOutput(BaseModel):
-    sub_tasks: list[SubTaskModel]
+```bash
+# Start Ollama (if not running as service)
+ollama serve
 
-result = await llm.with_structured_output(PlanOutput).ainvoke(prompt)
-# → PlanOutput(sub_tasks=[...])  # typed, no parsing needed
+# Pull models
+ollama pull qwen3.5:4b
+ollama pull nomic-embed-text
+
+# Optional: create custom model with 256K context
+ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b
+```
+
+### Memory Budget (Mac Unified Memory)
+
+| Component | Estimate |
+|---|---|
+| LLM weights (Q4_K_M, 4B) | ~3.5GB |
+| KV cache (256K context, fp16) | ~2.5GB |
+| Embeddings (`nomic-embed-text`) | ~0.5GB |
+| System + overhead | ~2GB |
+| **Total** | **~8.5GB** — fits in 16GB with headroom |
+
+### CLI Flags
+
+```bash
+# Run with custom iteration limit
+python -m research_agent --iterations 3
+
+# Run with verbose streaming
+python -m research_agent --verbose
 ```
 
 ---

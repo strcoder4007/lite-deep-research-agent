@@ -2,8 +2,7 @@ langgraph
 langchain
 langchain-text-splitters
 langchain-chroma
-langchain-openai
-openai
+langchain-ollama
 chromadb
 numpy
 ddgs

@@ -6,11 +6,11 @@
 
 **Architecture:** Orchestrator + parallel sub-agents via LangGraph `Send` fan-out. The orchestrator decomposes, dispatches, aggregates, and decides when to stop. Each sub-agent runs a single-pass search→fetch→analyze pipeline scoped to one sub-topic. All sub-agents run concurrently. Facts accumulate across research rounds via state channel reducers.
 
-**Target hardware:** Single GPU with ~16GB VRAM. vLLM serves both LLM and embeddings.
+**Target hardware:** Mac with Apple Silicon (M1/M2/M3) with 16GB+ unified memory. Runs entirely via Ollama.
 
 **Core models:**
-- LLM: `cyankiwi/Qwen3.5-4B-AWQ-4bit` via vLLM (256K context, 4B AWQ-4bit, ~2.5GB VRAM)
-- Embeddings: `nomic-ai/nomic-embed-text-v1.5` via vLLM (768d, ~275MB VRAM)
+- LLM: `qwen3.5:4b` via Ollama (256K context via `num_ctx`, Q4_K_M quantization, ~3.5GB)
+- Embeddings: `nomic-embed-text` via Ollama (768d, ~0.5GB)
 
 ---
 
@@ -19,13 +19,13 @@
 | Layer | Technology |
 |---|---|
 | Agent framework | LangGraph (`StateGraph`, `Send` fan-out, subgraph composition) |
-| LLM | vLLM — `langchain-openai.ChatOpenAI` |
-| Embeddings | vLLM — `langchain-openai.OpenAIEmbeddings` |
+| LLM | Ollama — `langchain_ollama.ChatOllama` |
+| Embeddings | Ollama — `langchain_ollama.OllamaEmbeddings` |
 | Vector DB | Chroma (persisted to `./advanced_memory/`) |
 | Text splitting | `RecursiveCharacterTextSplitter` (chunk=1000, overlap=100) |
 | Search | DuckDuckGo (`ddgs`) with `s.jina.ai` auto-fallback |
 | HTML fetching | `trafilatura` (multi-extractor pipeline, clean markdown output) |
-| Structured output | Pydantic models via `with_structured_output()` / vLLM `guided_json` |
+| Structured output | Pydantic models via `with_structured_output()` (json_mode) |
 | Tracing | LangSmith (optional, via env vars) |
 | Configuration | `.env` + `config.py` |
 
@@ -42,7 +42,7 @@ lite-deep-research-agent/
 │
 ├── research_agent/
 │   ├── __init__.py
-│   ├── __main__.py                # Entry: --start-vllm, --llm-url, query selection
+│   ├── __main__.py                # Entry: --iterations, --verbose, query selection
 │   ├── config.py                  # All env-read constants
 │   ├── llm.py                     # create_llm(), create_embedder(), ResearchTools dataclass
 │   ├── state.py                   # ResearchState TypedDict, SubTask type, reducers, helpers
@@ -56,8 +56,8 @@ lite-deep-research-agent/
 │   └── cli.py                     # Async REPL with streaming output
 │
 └── scripts/
-    ├── setup.sh                   # pip install, vllm model download
-    └── serve.sh                   # Launch vLLM LLM + embedding servers
+    ├── setup.sh                   # pip install, ollama pull
+    └── serve.sh                   # Launch Ollama (optional helper)
 ```
 
 ---
@@ -146,7 +146,7 @@ class SubTask(TypedDict):
 
 ---
 
-## vLLM Setup
+## Ollama Setup
 
 ### Quick Start
 
@@ -154,34 +154,49 @@ class SubTask(TypedDict):
 # One-time setup
 bash scripts/setup.sh
 
-# Start vLLM servers
-bash scripts/serve.sh
+# Start Ollama
+ollama serve
 
-# Run agent (connects to running vLLM)
+# Run agent
 python -m research_agent
-
-# Or auto-launch vLLM ephemerally
-python -m research_agent --start-vllm
 ```
 
-### Servers
+### Model Config (256K context)
 
-| Server | Port | Model | VRAM |
-|---|---|---|---|
-| LLM | `localhost:8000` | `cyankiwi/Qwen3.5-4B-AWQ-4bit` | ~5GB |
-| Embeddings | `localhost:8001` | `nomic-ai/nomic-embed-text-v1.5` | ~1GB |
+Create a Modelfile for 256K context:
 
-vLLM's continuous batching handles concurrent LLM calls from parallel sub-agents efficiently.
+```dockerfile
+# Modelfile.qwen3.5-4b-256k
+FROM qwen3.5:4b
+PARAMETER num_ctx 262144
+PARAMETER temperature 0.25
+PARAMETER num_thread 4
+```
+
+Apply: `ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b-256k`
+
+Then use `qwen3.5-4b-256k` as `LLM_MODEL` in `.env`.
+
+### Memory Budget (Mac Unified Memory)
+
+| Component | Estimate |
+|---|---|
+| LLM weights (Q4_K_M, 4B) | ~3.5GB |
+| KV cache (256K context, fp16) | ~2.5GB |
+| Embeddings (`nomic-embed-text`) | ~0.5GB |
+| System + overhead | ~2GB |
+| **Total** | **~8.5GB** — fits in 16GB with headroom |
 
 ### Structured Output
 
-vLLM supports `guided_json` natively. All LLM calls that produce structured data use `with_structured_output(PydanticModel)`:
+Ollama supports structured output via `json_mode` / `function_calling`. All LLM calls that produce structured data use `with_structured_output(PydanticModel)`:
 
 ```python
 class PlanOutput(BaseModel):
     sub_tasks: list[SubTaskModel]
 
 result = await llm.with_structured_output(PlanOutput).ainvoke(prompt)
+# → PlanOutput(sub_tasks=[...]) — typed, no parsing needed
 ```
 
 No YAML parsing. No `/no_think` hack. No fallback logic.
@@ -234,11 +249,10 @@ trafilatura uses a multi-extractor pipeline (readability, justext, boilerpy3) to
 ### In Progress (architectural rewrite)
 
 - **Orchestrator + sub-agent architecture** — replacing the monolithic pipeline with parallel fan-out. See HLD.md for full design.
-- **vLLM migration** — replacing Ollama with vLLM for both LLM and embeddings.
+- **Ollama integration** — using Ollama for both LLM and embeddings on Mac.
 - **trafilatura** — replacing requests+BeautifulSoup with trafilatura for better extraction.
 - **Multi-backend search** — DuckDuckGo + s.jina.ai fallback, configurable.
 - **Structured output** — replacing YAML parsing with Pydantic typed output models.
-- **trafilatura** — replacing requests+BeautifulSoup for cleaner page extraction.
 
 ### Remaining Improvements (post-rewrite)
 
