@@ -1,455 +1,173 @@
 # High-Level Design — lite-deep-research-agent
 
+> **Status note:** This document originally described a parallel sub-agent (`Send` fan-out) orchestrator. The **implemented** system is a **monolithic, sequential LangGraph pipeline** (`plan → search → fetch → analyze → should_continue → memory → synthesize`). The sub-agent architecture is a *future* target (see §12 Roadmap) and is **not** in the current code. This document has been updated to describe what is actually implemented, plus the recent optimization pass.
+
 ## 1. System Overview
 
-**lite-deep-research-agent** is an orchestrator-driven research system built on LangGraph. It decomposes a user query into independent sub-topics, spawns parallel sub-agents to research each sub-topic, aggregates results across rounds, and synthesizes a single grounded, sourced report.
-
-The orchestrator uses **LLM-driven decomposition and iteration control**. Sub-agents are **single-pass research pipelines** (search → fetch → analyze → per-topic memory) that run concurrently via LangGraph's `Send` fan-out mechanism. Facts accumulate across research rounds using state channel reducers.
+**lite-deep-research-agent** is a local deep-research agent built on LangGraph. It plans search queries from a user question, searches the web, fetches and extracts content, iterates when coverage is thin, and synthesizes a grounded, sourced report. Everything runs locally via Ollama (LLM + embeddings).
 
 ### Design Goals
 
-| Goal | How |
+| Goal | How (current) |
 |---|---|
-| **Lightweight** | 4B model via Ollama, 137MB embeddings, zero cloud dependencies |
-| **Parallel by default** | LangGraph `Send` fan-out spawns N sub-agents concurrently |
-| **LLM-driven iteration** | Orchestrator decides when coverage is sufficient; generates follow-up sub-tasks |
-| **Grounded output** | Every fact traced to a source URL; per-topic memory enriches context |
-| **Single GPU** | Ollama serves both LLM and embeddings under 16GB unified memory total |
+| **Lightweight** | Small Ollama model (4B-class), local embeddings, zero cloud dependencies |
+| **Local-first** | Ollama serves both LLM and embeddings; Chroma for memory; no external APIs |
+| **Grounded output** | Facts extracted with `source_url` via structured output; citations flow into the report |
+| **Iterative** | `should_continue` loops back to search when coverage is insufficient (safety-capped) |
+| **Single process** | Sequential node pipeline; I/O (fetch) parallelized within the fetch node |
 
 ---
 
-## 2. Architecture Overview
+## 2. Architecture Overview (implemented)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        ORCHESTRATOR GRAPH                        │
-│                                                                  │
-│  ┌─────────┐   ┌───────────────────┐   ┌────────────┐           │
-│  │  plan   │──▶│  research_round   │──▶│  aggregate  │           │
-│  │ (decomp)│   │  (subgraph, N     │   │ (dedup,     │           │
-│  │         │   │   parallel sub-   │   │  merge,     │           │
-│  │         │   │   agents via Send)│   │  gap check) │           │
-│  └─────────┘   └───────────────────┘   └─────┬──────┘           │
-│                                              │                   │
-│                                     ┌────────▼──────────┐       │
-│                                     │ should_continue    │       │
-│                                     │ LLM decides:       │       │
-│                                     │ coverage ok?       │       │
-│                                     └──┬────────────┬───┘       │
-│                                  "yes" │            │ "no"      │
-│                                        ▼            ▼           │
-│                              ┌──────────┐  ┌─────────────────┐  │
-│                              │  memory  │  │ generate new     │  │
-│                              │ (global) │  │ sub_tasks +      │  │
-│                              └────┬─────┘  │ goto plan        │  │
-│                                   ▼         └─────────────────┘  │
-│                              ┌──────────┐                        │
-│                              │synthesize│                        │
-│                              └────┬─────┘                        │
-│                                   ▼                              │
-│                                  END                             │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────┐
-│     research_round SUBGRAPH         │
-│                                     │
-│  dispatch ──► [Send fan-out to      │
-│                N sub_agent          │
-│                instances]           │
-│                                     │
-│  sub_agent SUBGRAPH (N instances):  │
-│  ┌──────────────────────────────┐   │
-│  │ sub_search → sub_fetch →     │   │
-│  │ sub_analyze → sub_memory     │   │
-│  │ (per-topic)                  │   │
-│  └──────────────────────────────┘   │
-│                                     │
-│  All instances complete → fan-in    │
-│  Reducers (operator.add) merge:     │
-│    search_results, fetched_content, │
-│    extracted_facts                  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  MONOLITHIC RESEARCH GRAPH                     │
+│                                                                │
+│   ┌──────┐   ┌────────┐   ┌────────┐   ┌─────────┐            │
+│   │ plan │──▶│ search │──▶│ fetch  │──▶│ analyze │            │
+│   └──────┘   └────────┘   └────────┘   └─────────┘            │
+│                                            │                  │
+│                                     ┌──────▼─────────┐        │
+│                                     │ should_continue │        │
+│                                     └──┬─────────┬───┘        │
+│                                  "search"│       │"synthesize" │
+│                                        ▼       ▼             │
+│                                (loop back)  ┌────────┐        │
+│                                            │ memory │        │
+│                                            └───┬────┘        │
+│                                                ▼             │
+│                                            │synthesize│      │
+│                                            └───┬────┘        │
+│                                                ▼             │
+│                                               END            │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+The graph is a single `StateGraph(ResearchState)` compiled in `graph.py`. All nodes are synchronous and run in order; `fetch_node` parallelizes its own I/O internally with `asyncio`.
 
 ---
 
 ## 3. State Design
 
 ```python
-from typing import Annotated, Any, Dict, List, Optional, TypedDict
-import operator
-
-class SubTask(TypedDict):
-    """A self-contained research task for a sub-agent."""
-    task_id: str
-    topic: str         # sub-topic label (e.g., "Pricing", "Performance")
-    query: str          # focused search query
-    focus: str          # what facts to extract
-    max_pages: int      # dynamic page budget (2–8)
+from typing import Any, Dict, List, Optional, TypedDict
 
 class ResearchState(TypedDict, total=False):
-    # ── Input ──
     query: str                              # original user question
-
-    # ── Decomposition ──
-    sub_tasks: List[SubTask]                 # plan_node outputs; replan rewrites
-
-    # ── Sub-agent outputs (accumulated via operator.add reducers) ──
-    search_results: Annotated[List[Dict[str, Any]], operator.add]
-    fetched_content: Annotated[List[Dict[str, Any]], operator.add]
-    extracted_facts: Annotated[List[str], operator.add]
-    sub_agent_errors: Annotated[List[str], operator.add]
-
-    # ── Aggregation ──
-    aggregated_facts: List[str]              # deduplicated fact list
-    unique_sources: List[str]                # deduplicated URLs
-    coverage_sufficient: bool                # LLM assessment
-    plan_gaps: List[str]                     # what's still missing
-
-    # ── Memory ──
-    per_topic_memory: List[Dict[str, Any]]   # from sub-agent per-topic queries
-    global_memory: List[Dict[str, Any]]      # from central memory_node
-
-    # ── Synthesis ──
-    final_answer: str
-    sources: List[str]
-
-    # ── Control ──
-    iteration: int
-    max_iterations: int                      # safety cap (default 5)
-    next_step: str                           # "continue" | "synthesize"
-
-    # ── Observability ──
-    messages: List[str]
+    research_plan: Dict[str, Any]           # parsed plan (queries/aspects/gaps)
+    search_queries: List[str]               # queries this round (accumulate across loops)
+    search_results: List[Dict[str, Any]]    # reranked results
+    fetched_content: List[Dict[str, Any]]   # fetched pages (url/title/text/metadata)
+    extracted_facts: List[str]              # "claim (source: url)" strings
+    relevant_memory: List[Dict[str, Any]]   # Chroma retrieval for synthesis
+    final_answer: str                       # synthesized report
+    sources: List[str]                      # cited source URLs
+    iteration: int                          # current round
+    max_iterations: int                     # safety cap
+    plan_gaps: List[str]                    # gaps driving continuation
+    next_step: str                          # "search" | "synthesize"
     errors: List[str]
+    messages: List[str]
 ```
 
-### Reducer Semantics
+### State semantics
 
-Fields annotated with `Annotated[List[...], operator.add]` accumulate across parallel branches. When N sub-agents complete, each one's `extracted_facts` list is concatenated via `operator.add`, producing a unified list for the orchestrator.
-
-Fields without a reducer (like `final_answer`, `next_step`, `aggregated_facts`) are overwritten by the last node that writes them. The orchestrator nodes after the fan-in barrier own these.
+Unlike the original sub-agent design, there are **no** `Annotated[..., operator.add]` reducers. Each node returns the keys it owns and the pipeline carries a single growing list of facts via plain reassignment in `agent.py` (`latest_state = {**latest_state, **data}`). `extracted_facts` therefore persists across iterations because `should_continue` and later nodes don't overwrite it.
 
 ---
 
 ## 4. Component Design
 
-### 4.1 LLM: qwen3.5:4b via Ollama
+### 4.1 LLM: Ollama ChatOllama
 
 | Property | Value |
 |---|---|
-| Model | `qwen3.5:4b` |
-| Context window | 262144 (256K) via `num_ctx` |
-| Memory | ~4GB (Q4_K_M quantization) |
-| Server | Ollama (`localhost:11434`) |
-| Structured output | `json_mode` / `function_calling` via `with_structured_output()` |
-| LangChain client | `langchain_ollama.ChatOllama(model=..., num_ctx=262144)` |
+| Client | `langchain_ollama.ChatOllama` |
+| Model | `.env`: `qwen3.5:4b`; `config.py` default: `qwen3:8b-q4_K_M` |
+| Context window | 262144 (256K) recommended via `num_ctx` |
+| Embeddings | `.env`: `nomic-embed-text`; `config.py` default: `mxbai-embed-large` |
+| Structured output | `with_structured_output()` used in `analyze_node` |
 
-**Concurrency model:** Ollama processes requests sequentially. For parallel sub-agents, the orchestrator uses `ThreadPoolExecutor` with `asyncio.to_thread()` for I/O-bound search/fetch work, while LLM calls are naturally serialized per graph stage. This is sufficient since the graph structure (plan → fan-out → aggregate → synthesize) limits concurrent LLM calls to the fan-out phase.
+`create_llm()` in `tools.py` sets `num_thread=4`. For analysis, `analyze_node` binds a lower temperature (`ANALYSIS_TEMPERATURE`, default 0.1) before invoking.
 
-### 4.3 Search: DuckDuckGo + s.jina.ai
+### 4.2 Search: DuckDuckGo (`ddgs`)
 
-```python
-SEARCH_BACKEND = "duckduckgo"  # "duckduckgo" | "jina" | "brave"
-SEARCH_FALLBACK = True         # DDG → Jina auto-fallback when DDG returns < 3 results
-```
+`run_ddg_search()` in `tools.py` queries DuckDuckGo via the `ddgs` library (text or news, depending on `SEARCH_TIME_LIMIT`). Results are normalized to `{url, title, snippet, published_at}`.
 
-| Backend | Protocol | Results | Cost |
-|---|---|---|---|
-| DuckDuckGo | `ddgs` library scraping | 5–8 results, title+snippet | Free |
-| s.jina.ai | `GET https://s.jina.ai/search?q=...` | 5 results with extracted content | Free, 100 RPM |
-| Brave Search | `GET https://api.search.brave.com/...` | 10 results, LLM context endpoint | $5/mo free credit |
+> The original design specified `s.jina.ai` and `brave` fallbacks. These are **not** implemented in the current code — DuckDuckGo is the only backend.
 
-**Fallback logic:**
-1. Try configured `SEARCH_BACKEND`
-2. If < 3 results OR exception → try `s.jina.ai` (if `SEARCH_FALLBACK=1`)
-3. If still insufficient → return partial results, let `should_continue` replan
+### 4.3 Fetch: trafilatura (parallel)
 
-### 4.4 Fetch: trafilatura
+`fetch_url()` in `tools.py` uses `trafilatura.fetch_url()` then `trafilatura.extract()` with `output_format="markdown"`, `favor_precision=True`, `include_comments=False`, `include_tables=False`. Output is truncated to `MAX_PAGE_CHARS` (default 10000).
 
-Replaces `requests` + `BeautifulSoup`. trafilatura uses a multi-extractor pipeline (readability, justext, boilerpy3) and outputs clean text or markdown.
+`fetch_node` in `nodes.py` runs all fetches concurrently:
 
 ```python
-import trafilatura
-
-async def fetch_page(url: str, timeout: int = 15) -> Optional[Tuple[str, str]]:
-    downloaded = trafilatura.fetch_url(url, timeout=timeout)
-    if not downloaded:
-        return None
-    text = trafilatura.extract(
-        downloaded,
-        output_format="markdown",
-        favor_precision=True,       # prefer accuracy over quantity
-        include_links=False,        # strip raw links
-        include_images=False,
-        include_tables=False,
-    )
-    if not text or len(text) < 100:
-        return None
-    text = text[:MAX_PAGE_CHARS]
-    metadata = trafilatura.extract_metadata(downloaded)
-    title = metadata.title.strip() if metadata and metadata.title else url
-    return title, text
+sem = asyncio.Semaphore(config.FETCH_CONCURRENCY)  # default 5
+async def _fetch_one(item):
+    async with sem:
+        resp = await asyncio.to_thread(fetch_url, item["url"], config.REQUEST_TIMEOUT)
+    ...
+results = asyncio.run(_fetch_all(to_visit))
 ```
 
-**Parallel fetching within a sub-agent:** `asyncio.gather()` with a semaphore limiting concurrency (default 5). Since trafilatura is CPU-bound (not I/O), `run_in_executor` wraps the sync `trafilatura.fetch_url`.
+Memory writes happen **after** the gather, in the main thread, to avoid concurrent Chroma writes.
 
-**Why not crawl4ai:** crawl4ai adds ~500MB Chromium install and 300-500MB RAM overhead. For a lightweight agent targeting 16GB VRAM, trafilatura is sufficient. JavaScript-heavy pages that trafilatura can't handle are rare for research content (news articles, docs, papers are typically server-rendered).
+### 4.4 Memory: Chroma
 
-### 4.5 Memory: Chroma
+Persisted to `./advanced_memory/`, collection `research_memory`. `memory.py` provides `add_to_memory()` (splits text, writes chunks, persists) and `query_memory()` (similarity search with recency boost `1/(1+age_hours/24)`).
 
-Unchanged from current architecture. Persisted to `./advanced_memory/`. Collection `research_memory`.
+`fetch_node` writes each page; `memory_node` reads once before synthesis.
 
-**Per-topic memory (sub_memory_node in each sub-agent):**
-- Queries Chroma with the sub-task query + focus
-- Returns up to 5 chunks with recency boost
-- Writes newly fetched content to Chroma with metadata `{url, title, query, topic, focus, timestamp}`
+### 4.5 Analysis: structured fact extraction
 
-**Global memory (orchestrator's memory_node):**
-- Queries Chroma with the original user query
-- Provides broader context for synthesis
-- Uses the same recency boost formula: `1 / (1 + age_hours / 24)`
+`analyze_node` calls the LLM with `with_structured_output(AnalyzeOutput)`:
+
+```python
+class FactItem(BaseModel):
+    claim: str
+    source_url: str
+
+class AnalyzeOutput(BaseModel):
+    facts: List[FactItem]
+```
+
+Each page is analyzed with up to `ANALYSIS_SNIPPET_CHARS` (default 4000) of its text. Facts are stored as `"{claim} (source: {url})"` strings so citations survive into synthesis. A plain-text fallback runs if structured parsing fails.
 
 ---
 
-## 5. Graph Design
+## 5. Graph Design (`graph.py` / `nodes.py`)
 
-### 5.1 Parent Graph Nodes
+| Node | Input | Action | Output keys |
+|---|---|---|---|
+| `plan` | `query` | LLM → YAML → parse into queries/aspects/gaps | `research_plan`, `search_queries`, `plan_gaps` |
+| `search` | `search_queries` | DDG search + dedup + embedding rerank | `search_results` |
+| `fetch` | `search_results` | parallel trafilatura fetch + memory write | `fetched_content` |
+| `analyze` | `fetched_content` | per-page structured fact extraction | `extracted_facts` |
+| `should_continue` | `fetched_content`, `extracted_facts`, `plan_gaps`, `iteration` | heuristic loop decision | `next_step`, `search_queries`, `iteration` |
+| `memory` | `query`, `plan_gaps` | Chroma query for context | `relevant_memory` |
+| `synthesize` | `extracted_facts`, `relevant_memory` | LLM report with inline citations | `final_answer`, `sources` |
 
-#### `plan_node` (async)
+### Loop control
 
-```
-Input:  state.query
-Action: LLM with structured output decomposes query into sub-topics
-Output: state.sub_tasks (3–5 SubTask objects with dynamic max_pages)
-```
-
-Pydantic model:
-```python
-class PlanOutput(BaseModel):
-    sub_tasks: list[SubTaskModel]
-```
-
-Prompt template:
-```
-Decompose this research question into 3–5 independent sub-topics.
-For each sub-topic, provide:
-- topic: short label (1-3 words)
-- query: focused web search query
-- focus: what specific facts/information to extract from each page
-- max_pages: how many sources to consult (2–8, based on complexity/importance)
-Cover diverse angles: factual, analytical, comparative, practical.
-```
-
-#### `research_round` (compiled subgraph)
-
-A compiled subgraph added as a parent node. Internally fans out `sub_tasks` to N parallel `sub_agent` instances via `Send`. Each sub-agent runs `sub_search → sub_fetch → sub_analyze → sub_memory`. Outputs are merged via `operator.add` reducers.
-
-**Dispatch logic:**
-```python
-def fan_out(state: ResearchState) -> List[Send]:
-    return [
-        Send("sub_agent", {
-            "query": st["query"],
-            "topic": st["topic"],
-            "focus": st["focus"],
-            "max_pages": st["max_pages"],
-        })
-        for st in state["sub_tasks"]
-    ]
-```
-
-#### `aggregate_node` (sync, async wrapper)
-
-- Deduplicates `extracted_facts` using cosine similarity (threshold 0.85) against `nomic-embed-text` embeddings
-- Deduplicates source URLs
-- Prepares `aggregated_facts` and `unique_sources`
-- Assesses rough coverage (fact count per topic) but delegates final assessment to `should_continue`
-
-#### `should_continue_node` (async)
-
-```
-Input:  aggregated_facts, unique_sources, plan_gaps, iteration
-Action: LLM with structured output assesses coverage
-Output: coverage_sufficient + new_sub_tasks OR goto synthesize
-```
-
-Pydantic model:
-```python
-class CoverageAssessment(BaseModel):
-    coverage_sufficient: bool
-    reasoning: str
-    new_sub_tasks: Optional[list[SubTaskModel]]
-
-class SubTaskModel(BaseModel):
-    topic: str
-    query: str
-    focus: str
-    max_pages: int
-```
-
-Routing via `Command`:
-```python
-if assessment.coverage_sufficient or state["iteration"] >= state["max_iterations"]:
-    return Command(goto="memory", update={"next_step": "synthesize"})
-else:
-    return Command(goto="plan", update={
-        "sub_tasks": assessment.new_sub_tasks,
-        "iteration": state["iteration"] + 1,
-        "next_step": "continue",
-    })
-```
-
-**Safety:** Hard cap at `MAX_ITERATIONS` (default 5) prevents unbounded loops from small models.
-
-#### `memory_node` (async)
-
-Central memory query using original `state.query`. Merges with per-topic memory from sub-agents (already in `per_topic_memory`). Returns combined `global_memory`.
-
-#### `synthesize_node` (async)
-
-Builds a structured report prompt from:
-- `aggregated_facts` (tagged with `[Topic: X]` prefixes)
-- `global_memory`
-- `unique_sources`
-
-Report structure: Executive Summary → Numbered Findings → Analysis → Conclusion → Notes.
-
-Sources are listed with inline markers `[1]`, `[2]` pointing to a reference section.
-
-### 5.2 Sub-Agent Subgraph
-
-```
-sub_search → sub_fetch → sub_analyze → sub_memory → END
-```
-
-All nodes are async. The sub-agent uses `state.query` (sub-task query, set by `Send`) and `state.topic` for scoping.
-
-#### `sub_search_node`
-
-- Calls `search_web(state.query, max_results=config.SEARCH_PER_QUERY)` via configured backend
-- Deduplicates by URL + hostname
-- Reranks using embedding cosine similarity + recency bonus
-- Writes to `search_results` (operator.add accumulator)
-
-#### `sub_fetch_node`
-
-- Fetches up to `state.max_pages` results via trafilatura
-- Parallelizes with `asyncio.gather` + semaphore
-- Truncates to `MAX_PAGE_CHARS` (default 10000)
-- Writes to `fetched_content` (operator.add accumulator)
-
-#### `sub_analyze_node`
-
-- For each fetched page, calls LLM with structured output
-- Extracts grounded facts tagged with `[Topic: {topic}]` prefix
-- Pydantic model: `{facts: list[str], source_title: str, source_url: str}`
-- Writes to `extracted_facts` (operator.add accumulator)
-
-#### `sub_memory_node`
-
-- Query Chroma with sub-task query + focus (per-topic retrieval)
-- Write fetched content to Chroma with topic-enriched metadata
-- Returns per-topic memory chunks → `per_topic_memory`
-
-### 5.3 Graph Wiring (graph.py)
-
-```python
-def create_research_graph(tools: ResearchTools):
-    graph = StateGraph(ResearchState)
-
-    # Parent nodes
-    graph.add_node("plan", partial(plan_node, tools=tools))
-
-    # Research round: subgraph that internally fans out
-    research_round = create_research_round_graph(tools)
-    graph.add_node("research_round", research_round)
-
-    graph.add_node("aggregate", aggregate_node)
-    graph.add_node("should_continue", partial(should_continue_node, tools=tools))
-    graph.add_node("memory", partial(memory_node, tools=tools))
-    graph.add_node("synthesize", partial(synthesize_node, tools=tools))
-
-    # Entry
-    graph.set_entry_point("plan")
-
-    # Plan → research_round via Send fan-out (inside research_round subgraph)
-    graph.add_conditional_edges("plan", dispatch_to_round, ["research_round"])
-
-    # research_round → aggregate
-    graph.add_edge("research_round", "aggregate")
-    graph.add_edge("aggregate", "should_continue")
-
-    # should_continue routes via Command (no static edges needed)
-    graph.add_node("memory", partial(memory_node, tools=tools))
-    graph.add_edge("memory", "synthesize")
-    graph.add_edge("synthesize", END)
-
-    return graph.compile()
-
-
-def create_research_round_graph(tools: ResearchTools):
-    """Subgraph that fans out sub_tasks to parallel sub_agent instances."""
-    sub_agent = create_sub_agent_graph(tools)
-
-    graph = StateGraph(ResearchState)
-    graph.add_node("dispatch", dispatch_identity)  # pass-through for fan-out
-    graph.add_node("sub_agent", sub_agent)
-
-    graph.set_entry_point("dispatch")
-    graph.add_conditional_edges("dispatch", fan_out_to_sub_agents, ["sub_agent"])
-    graph.add_edge("sub_agent", END)
-
-    return graph.compile()
-
-
-def create_sub_agent_graph(tools: ResearchTools):
-    """Single-pass sub-agent: search → fetch → analyze → per-topic memory."""
-    graph = StateGraph(ResearchState)
-    graph.add_node("sub_search", partial(sub_search_node, tools=tools))
-    graph.add_node("sub_fetch", partial(sub_fetch_node, tools=tools))
-    graph.add_node("sub_analyze", partial(sub_analyze_node, tools=tools))
-    graph.add_node("sub_memory", partial(sub_memory_node, tools=tools))
-
-    graph.set_entry_point("sub_search")
-    graph.add_edge("sub_search", "sub_fetch")
-    graph.add_edge("sub_fetch", "sub_analyze")
-    graph.add_edge("sub_analyze", "sub_memory")
-    graph.add_edge("sub_memory", END)
-
-    return graph.compile()
-```
+`should_continue` returns `next_step="search"` when `iteration < max_iterations` AND (`fetched < MIN_FETCHED_FOR_STOP` OR `facts < MIN_FACTS_FOR_STOP` OR `plan_gaps`). Otherwise `next_step="synthesize"`. On continuation, new queries are appended as `f"{query} {gap}"`.
 
 ---
 
 ## 6. Data Flow (Request Lifecycle)
 
-### Initial Request
 ```
 User query
-  → plan_node: decompose into 3–5 SubTasks
-  → research_round: fan out via Send
-    → [SubAgent 1] DDG search → trafilatura fetch(5 pages) → LLM extract facts → memory store/query
-    → [SubAgent 2] DDG search → trafilatura fetch(4 pages) → LLM extract facts → memory store/query
-    → [SubAgent 3] DDG search → trafilatura fetch(6 pages) → LLM extract facts → memory store/query
-  → reducers merge: 45 search results, 15 fetched pages, 60 extracted facts
-  → aggregate_node: dedup → 12 unique pages, 48 unique facts
-  → should_continue: "Coverage insufficient on pricing and benchmarks"
-  → Command(goto="plan", sub_tasks=[SubTask("pricing"), SubTask("benchmarks")])
-
-### Round 2
-  → plan_node: receives new sub_tasks (carried forward from should_continue)
-  → research_round: fan out again
-    → [SubAgent 4] focused pricing search → fetch → analyze → memory
-    → [SubAgent 5] focused benchmark search → fetch → analyze → memory
-  → reducers merge again (facts accumulate across rounds!)
-  → aggregate_node: now 80 facts across 20 pages
-  → should_continue: "Coverage sufficient"
-  → Command(goto="memory")
-
-### Final (after fan-in)
-  → memory_node: global query + merge per-topic memory
-  → synthesize_node: LLM generates structured report with inline citations
+  → plan: 4–5 search queries + aspects + gaps
+  → search: DDG → dedup → embedding rerank → top-N
+  → fetch: parallel trafilatura fetch (≤ FETCH_LIMIT pages) → write to Chroma
+  → analyze: per-page structured facts (claim + source_url)
+  → should_continue: enough facts?
+        no  → append gap-based queries, iteration++, loop to search
+        yes → memory
+  → memory: Chroma query with original query + gaps
+  → synthesize: report from facts + memory, with inline source markers
   → END
 ```
 
@@ -460,136 +178,79 @@ User query
 ### Setup
 
 ```bash
-# One-time install
 pip install -r requirements.txt
-
-# Pull models (requires Ollama running: ollama serve)
+ollama serve
 ollama pull qwen3.5:4b
 ollama pull nomic-embed-text
 ```
 
-### Model Config (Modelfile for 256K context)
+### Model Config (256K context)
 
 ```dockerfile
-# Modelfile.qwen3.5-4b
+# Modelfile.qwen3.5-4b-256k
 FROM qwen3.5:4b
 PARAMETER num_ctx 262144
 PARAMETER temperature 0.25
 PARAMETER num_thread 4
 ```
 
-Apply with: `ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b`
+`ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b-256k`
 
-### Memory Budget (Mac Unified Memory)
-
-| Component | Estimate |
-|---|---|
-| LLM weights (Q4_K_M, 4B) | ~3.5GB |
-| KV cache (256K context, fp16) | ~2.5GB |
-| Embeddings (`nomic-embed-text`) | ~0.5GB |
-| System + overhead | ~2GB |
-| **Total** | **~8.5GB** — fits in 16GB unified memory with headroom |
-
-### Client Code
-
-```python
-# research_agent/llm.py
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-
-def create_llm() -> ChatOllama:
-    return ChatOllama(
-        model=config.LLM_MODEL,          # "qwen3.5:4b" or "qwen3.5-4b-256k"
-        base_url=config.OLLAMA_BASE_URL,  # http://localhost:11434
-        temperature=config.LLM_TEMPERATURE,
-        num_ctx=config.LLM_NUM_CTX,       # 262144
-        num_thread=4,
-    )
-
-def create_embedder() -> OllamaEmbeddings:
-    return OllamaEmbeddings(
-        model=config.EMBED_MODEL,         # "nomic-embed-text"
-        base_url=config.OLLAMA_BASE_URL,
-    )
-```
-
-### Server Launch
-
-Ollama runs as a single server on port 11434:
-
-```bash
-# Start Ollama (if not running as service)
-ollama serve
-
-# Pull models
-ollama pull qwen3.5:4b
-ollama pull nomic-embed-text
-
-# Optional: create custom model with 256K context
-ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b
-```
-
-### Memory Budget (Mac Unified Memory)
+### Memory Budget (Mac Unified Memory, indicative)
 
 | Component | Estimate |
 |---|---|
-| LLM weights (Q4_K_M, 4B) | ~3.5GB |
+| LLM weights (4B, Q4_K_M) | ~3.5GB |
 | KV cache (256K context, fp16) | ~2.5GB |
-| Embeddings (`nomic-embed-text`) | ~0.5GB |
+| Embeddings | ~0.5GB |
 | System + overhead | ~2GB |
-| **Total** | **~8.5GB** — fits in 16GB with headroom |
+| **Total** | **~8.5GB** |
 
 ### CLI Flags
 
 ```bash
-# Run with custom iteration limit
+python -m research_agent            # interactive REPL
+python -m research_agent --verbose   # node-by-node timing (default)
 python -m research_agent --iterations 3
-
-# Run with verbose streaming
-python -m research_agent --verbose
 ```
 
 ---
 
-## 8. Configuration
+## 8. Configuration (`config.py`)
 
-### Environment Variables
+All values read from env vars with sensible defaults. Key settings:
 
 ```bash
-# ── vLLM ──
-LLM_BASE_URL=http://localhost:8000/v1
-LLM_MODEL_NAME=cyankiwi/Qwen3.5-4B-AWQ-4bit
-EMBED_BASE_URL=http://localhost:8001/v1
-EMBED_MODEL_NAME=nomic-ai/nomic-embed-text-v1.5
-VLLM_START_SERVERS=0              # 1 = auto-launch vLLM subprocesses
-
-# ── LLM params ──
+# Models
+LLM_MODEL=qwen3.5:4b            # or qwen3:8b-q4_K_M
+EMBED_MODEL=nomic-embed-text    # or mxbai-embed-large
 LLM_TEMPERATURE=0.25
 LLM_MAX_TOKENS=2048
-SYNTH_MAX_TOKENS=4096
+LLM_NUM_CTX=262144
 
-# ── Search ──
-SEARCH_BACKEND=duckduckgo         # duckduckgo | jina | brave
-SEARCH_FALLBACK=1                 # DDG → jina auto-fallback
-SEARCH_PER_QUERY=8                # results per sub-agent search
+# Search
+SEARCH_RESULTS_PER_QUERY=8
+SEARCH_RERANK_TOP_N=10
+SEARCH_RERANK_USE_HOST_DEDUP=1
+SEARCH_SINCE_DAYS=0
 SEARCH_RECENCY_BOOST=0.05
-SEARCH_HOST_DEDUP=1
+FETCH_LIMIT=15
 
-# ── Fetch ──
-MAX_PAGE_CHARS=10000              # chars per fetched page
-FETCH_TIMEOUT=15                  # seconds per page
-FETCH_CONCURRENCY=5               # parallel fetches per sub-agent
+# Fetch
+MAX_PAGE_CHARS=10000
+REQUEST_TIMEOUT=12
+FETCH_CONCURRENCY=5
 
-# ── Sub-agents ──
-MAX_SUB_TASKS=5                   # max sub-tasks per plan
-DEFAULT_PAGES_PER_TASK=5          # fallback when LLM doesn't set max_pages
-MIN_PAGES_PER_TASK=2
-MAX_PAGES_PER_TASK=8
+# Analysis (added in optimization pass)
+ANALYSIS_SNIPPET_CHARS=4000
+ANALYSIS_TEMPERATURE=0.1
 
-# ── Iteration ──
-MAX_ITERATIONS=5                  # safety cap for research rounds
-MIN_FACTS_FOR_COVERAGE=20         # rough threshold
+# Iteration / loop
+MAX_ITERATIONS=2                 # .env overrides to 5
+MIN_FETCHED_FOR_STOP=3
+MIN_FACTS_FOR_STOP=5
 
-# ── Memory ──
+# Memory
 MEMORY_DIR=advanced_memory
 MEMORY_TOP_K=5
 MEMORY_SIMILARITY_THRESHOLD=0.35
@@ -597,18 +258,11 @@ MEMORY_MIN_CHARS=200
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=100
 
-# ── Dedup ──
-FACT_DEDUP_THRESHOLD=0.85         # cosine similarity for duplicate facts
-
-# ── Tracing ──
+# Tracing (optional)
 LANGCHAIN_TRACING_V2=false
 LANGCHAIN_API_KEY=
 LANGCHAIN_PROJECT=lite-deep-research
 ```
-
-### config.py Constants
-
-All values read from env vars with sensible defaults. The `config.py` module is the single source of truth — no constants hardcoded in node implementations.
 
 ---
 
@@ -616,51 +270,37 @@ All values read from env vars with sensible defaults. The `config.py` module is 
 
 ```
 lite-deep-research-agent/
-├── HLD.md                         # This document
-├── handoff.md                     # Updated project handoff
-├── requirements.txt               # Updated dependencies
-├── .env.example                   # Template for configuration
+├── HLD.md                  # This document
+├── handoff.md              # Project handoff reference
+├── README.md               # User-facing readme
+├── requirements.txt
+├── .env                    # Configuration (edit directly)
 │
 ├── research_agent/
 │   ├── __init__.py
-│   ├── __main__.py                # Entry: handles --start-vllm, --llm-url etc.
-│   ├── config.py                  # All env+constants
-│   ├── llm.py                     # create_llm(), create_embedder(), ResearchTools
-│   ├── state.py                   # ResearchState, SubTask, reducers, helpers
-│   ├── search.py                  # search_web() — multi-backend + DDG→Jina fallback
-│   ├── fetch.py                   # trafilatura async wrapper, fetch_pages()
-│   ├── memory.py                  # Chroma add/query with recency boost
-│   ├── sub_agent.py               # Sub-agent subgraph + 4 nodes
-│   ├── nodes.py                   # Orchestrator nodes: plan, aggregate, should_continue, memory, synthesize
-│   ├── graph.py                   # create_research_graph() — composes all subgraphs
-│   ├── agent.py                   # AdvancedResearchAgent — async research() with streaming
-│   └── cli.py                     # Async CLI with REPL + streaming output
+│   ├── __main__.py         # Entry point (loads .env, runs CLI)
+│   ├── config.py           # All env-read constants
+│   ├── tools.py            # ResearchTools, LLM/embedder/vectorstore factories,
+│   │                       #   DDG search, trafilatura fetch_url, helpers
+│   ├── state.py            # ResearchState, helpers (append_message/append_error)
+│   ├── memory.py           # Chroma add/query with recency boosting
+│   ├── nodes.py            # All orchestrator nodes (plan/search/fetch/analyze/...)
+│   ├── graph.py            # create_research_graph() — compiles the pipeline
+│   ├── agent.py            # AdvancedResearchAgent — synchronous stream + logging
+│   └── cli.py              # Interactive REPL, saves report to reports/
 │
 └── scripts/
-    ├── setup.sh                   # One-time: pip install, vllm pull models
-    └── serve.sh                   # Launch both vLLM servers
+    ├── setup.sh            # pip install + ollama pull
+    └── serve.sh            # Launch Ollama
 ```
+
+> Note: there is **no** `llm.py` / `search.py` / `fetch.py` / `sub_agent.py` — those were from the earlier sub-agent design. The current code consolidates everything into `tools.py` + `nodes.py`.
 
 ---
 
 ## 10. Streaming & Observability
 
-### Node-by-node streaming
-
-The `AdvancedResearchAgent.research()` method is an `async generator` that yields `StreamEvent` objects per node:
-
-```python
-async for event in agent.research(query):
-    print(f"[{event.node}] {event.summary}")
-    # → [plan] Decomposed into 4 sub-tasks
-    # → [sub_agent] Researching "Pricing": 6 pages, 12 facts
-    # → [sub_agent] Researching "Performance": 5 pages, 8 facts
-    # → [aggregate] 20 unique facts, 3 gaps identified
-```
-
-### LangSmith
-
-When `LANGCHAIN_TRACING_V2=true`, all nodes, sub-graphs, and LLM calls are traced. Each sub-agent's internal nodes appear as nested traces under the `research_round` span.
+`AdvancedResearchAgent.research()` streams graph events synchronously and logs per-node timing + summary (results/fetched/facts/memory/sources/errors counts). When `LANGCHAIN_TRACING_V2=true`, nodes and LLM calls are traced via LangSmith.
 
 ---
 
@@ -668,24 +308,32 @@ When `LANGCHAIN_TRACING_V2=true`, all nodes, sub-graphs, and LLM calls are trace
 
 | Failure | Strategy |
 |---|---|
-| DDG search fails | Auto-fallback to s.jina.ai |
-| s.jina.ai also fails | Return empty results, let should_continue replan |
-| trafilatura fetch timeout | Skip page, log error, continue with remaining pages |
-| LLM structured output parse failure | Retry once with temperature=0; if still fails, skip that LLM call |
-| vLLM server unreachable | Exit with clear error: "vLLM not running. Run with --start-vllm or start servers manually." |
-| All sub-agents return 0 facts | should_continue replans with more focused queries |
-| Max iterations reached | Force synthesize with available facts, note gaps in report |
-| Chroma persistence error | Log warning, continue with in-memory operation |
+| DDG search fails | Returns empty results; `should_continue` may loop or synthesize with what's available |
+| trafilatura fetch fails / empty | Page skipped (returns `None`); remaining pages continue |
+| Structured analysis parse failure | Falls back to plain-text fact extraction for that page |
+| Chroma persistence error | Logged; run continues with in-memory operation |
+| Max iterations reached | Forces synthesis with available facts |
+| All pages yield 0 facts | `should_continue` loops with gap-based queries; eventually synthesizes with gaps noted |
 
 ---
 
-## 12. Future Roadmap
+## 12. Roadmap
 
-| Priority | Feature |
-|---|---|
-| P1 | Human-in-the-loop checkpoints (approve plan, review sources) |
-| P1 | Cross-encoder reranking for search results |
-| P2 | Gradio web UI |
-| P2 | Markdown report export with DOI-like citations |
-| P3 | Playwright-based fallback for JS pages trafilatura misses |
-| P3 | Source URL accessibility verification (HEAD requests post-synthesis) |
+| Priority | Feature | Status |
+|---|---|---|
+| Done | Parallel trafilatura fetch | ✅ |
+| Done | Structured fact extraction with source URLs | ✅ |
+| Done | Larger analysis context + lower analysis temperature | ✅ |
+| Done | Fix recency date-filter bug (`site:news`) | ✅ |
+| P1 | Orchestrator + parallel sub-agent `Send` fan-out architecture | ⬜ not started |
+| P1 | Cross-encoder reranking for search results | ⬜ |
+| P1 | LLM-driven coverage assessment in `should_continue` (replace heuristic) | ⬜ |
+| P1 | Pydantic structured output for `plan_node` (replace YAML) | ⬜ |
+| P2 | Cross-source fact deduplication (cosine similarity) | ⬜ |
+| P2 | Human-in-the-loop checkpoints | ⬜ |
+| P2 | Gradio web UI | ⬜ |
+| P2 | Markdown report export with references | ⬜ |
+| P3 | Playwright JS fallback for trafilatura misses | ⬜ |
+| P3 | `s.jina.ai` / `brave` search fallback | ⬜ |
+| P3 | Source URL accessibility verification (HEAD checks) | ⬜ |
+| P3 | Embedding fallback to CPU | ⬜ |

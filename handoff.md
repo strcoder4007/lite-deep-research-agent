@@ -2,15 +2,15 @@
 
 ## Project Overview
 
-**What it does:** A LangGraph-based deep research agent powered by an orchestrator that decomposes user queries into independent sub-topics, spawns parallel sub-agents to research each sub-topic, iterates when coverage is insufficient, and synthesizes a grounded, sourced research report.
+**What it does:** A LangGraph-based deep research agent. An orchestrator decomposes the user query into search queries, runs a single-pass search → fetch → analyze pipeline, iterates when coverage is insufficient, and synthesizes a grounded, sourced research report.
 
-**Architecture:** Orchestrator + parallel sub-agents via LangGraph `Send` fan-out. The orchestrator decomposes, dispatches, aggregates, and decides when to stop. Each sub-agent runs a single-pass search→fetch→analyze pipeline scoped to one sub-topic. All sub-agents run concurrently. Facts accumulate across research rounds via state channel reducers.
+**Architecture:** A single LangGraph `StateGraph` pipeline (monolithic, sequential nodes). The orchestrator plans queries, searches, fetches pages, extracts facts, decides whether to continue, queries memory, and synthesizes. All state is carried in one `ResearchState` TypedDict. (A parallel sub-agent `Send` fan-out design is a *future* target — see roadmap — but is **not** implemented yet.)
 
 **Target hardware:** Mac with Apple Silicon (M1/M2/M3) with 16GB+ unified memory. Runs entirely via Ollama.
 
-**Core models:**
-- LLM: `qwen3.5:4b` via Ollama (256K context via `num_ctx`, Q4_K_M quantization, ~3.5GB)
-- Embeddings: `nomic-embed-text` via Ollama (768d, ~0.5GB)
+**Core models (configurable via `.env`):**
+- LLM: `qwen3.5:4b` via Ollama by default in `.env` (config.py default `qwen3:8b-q4_K_M`). 256K context via `num_ctx` is recommended.
+- Embeddings: `nomic-embed-text` via Ollama by default in `.env` (config.py default `mxbai-embed-large`).
 
 ---
 
@@ -18,16 +18,18 @@
 
 | Layer | Technology |
 |---|---|
-| Agent framework | LangGraph (`StateGraph`, `Send` fan-out, subgraph composition) |
+| Agent framework | LangGraph (`StateGraph`, sequential node pipeline) |
 | LLM | Ollama — `langchain_ollama.ChatOllama` |
 | Embeddings | Ollama — `langchain_ollama.OllamaEmbeddings` |
 | Vector DB | Chroma (persisted to `./advanced_memory/`) |
 | Text splitting | `RecursiveCharacterTextSplitter` (chunk=1000, overlap=100) |
-| Search | DuckDuckGo (`ddgs`) with `s.jina.ai` auto-fallback |
+| Search | DuckDuckGo (`ddgs`) |
 | HTML fetching | `trafilatura` (multi-extractor pipeline, clean markdown output) |
-| Structured output | Pydantic models via `with_structured_output()` (json_mode) |
+| Structured output | Pydantic models via `with_structured_output()` for fact extraction |
 | Tracing | LangSmith (optional, via env vars) |
 | Configuration | `.env` + `config.py` |
+
+> **Note:** The earlier design called for a `s.jina.ai` fallback and a `brave` backend. The current implementation uses DuckDuckGo only (no fallback). Structured-output fact extraction is implemented in `analyze_node`; the `plan_node` still uses YAML parsing.
 
 ---
 
@@ -35,25 +37,22 @@
 
 ```
 lite-deep-research-agent/
-├── HLD.md                         # High-Level Design (comprehensive)
+├── HLD.md                         # High-Level Design (updated to match implementation)
 ├── handoff.md                     # This file
 ├── requirements.txt
 ├── .env.example
 │
 ├── research_agent/
 │   ├── __init__.py
-│   ├── __main__.py                # Entry: --iterations, --verbose, query selection
+│   ├── __main__.py                # Entry: loads .env, runs CLI
 │   ├── config.py                  # All env-read constants
-│   ├── llm.py                     # create_llm(), create_embedder(), ResearchTools dataclass
-│   ├── state.py                   # ResearchState TypedDict, SubTask type, reducers, helpers
-│   ├── search.py                  # search_web() — multi-backend with DDG→Jina fallback
-│   ├── fetch.py                   # trafilatura async wrapper, parallel fetch_pages()
+│   ├── tools.py                   # ResearchTools, create_llm/embedder/vectorstore, DDG search, trafilatura fetch, helpers
+│   ├── state.py                   # ResearchState TypedDict, helpers
 │   ├── memory.py                  # Chroma add/query with recency boosting
-│   ├── sub_agent.py               # Sub-agent subgraph + sub_search/fetch/analyze/memory nodes
-│   ├── nodes.py                   # Orchestrator nodes: plan, aggregate, should_continue, memory, synthesize
-│   ├── graph.py                   # create_research_graph() — composes parent + subgraph
-│   ├── agent.py                   # AdvancedResearchAgent — async generator with streaming
-│   └── cli.py                     # Async REPL with streaming output
+│   ├── nodes.py                   # All orchestrator nodes: plan, search, fetch, analyze, should_continue, memory, synthesize
+│   ├── graph.py                   # create_research_graph() — composes the pipeline
+│   ├── agent.py                   # AdvancedResearchAgent — synchronous stream with logging
+│   └── cli.py                     # Interactive REPL with report output
 │
 └── scripts/
     ├── setup.sh                   # pip install, ollama pull
@@ -64,85 +63,53 @@ lite-deep-research-agent/
 
 ## Architecture
 
-### Graph Flow
+### Graph Flow (current implementation)
 
 ```
-plan → research_round → aggregate → should_continue
-                                           │
-                        ┌──────────────────┼──────────────────┐
-                        ▼                                     ▼
-                    "continue"                           "synthesize"
-                        │                                     │
-                    [re-enter                            memory → synthesize → END
-                    research_round]
+plan → search → fetch → analyze → should_continue
+                                            │
+                         ┌──────────────────┼──────────────────┐
+                         ▼                                     ▼
+                     "search"                            "synthesize"
+                         │                                     │
+                     [re-enter                          memory → synthesize → END
+                     search → fetch → analyze]
 ```
 
-### Orchestrator Nodes (parent graph)
+### Orchestrator Nodes (all in `nodes.py`)
 
 | Node | Role |
 |---|---|
-| `plan` | LLM decomposes user query into 3–5 `SubTask` objects (structured output). Sets `max_pages` per task dynamically (2–8). |
-| `research_round` | Compiled subgraph. Fans out `sub_tasks` to N parallel `sub_agent` instances via `Send`. Merges outputs via `operator.add` reducers. |
-| `aggregate` | Deduplicates facts (cosine similarity, threshold 0.85) and sources. Prepares `aggregated_facts` + `unique_sources`. |
-| `should_continue` | LLM assesses coverage. If insufficient → generates new focused `sub_tasks` → `Command(goto="research_round")`. If sufficient → `Command(goto="memory")`. Safety cap at `MAX_ITERATIONS`. |
-| `memory` | Global Chroma query with original user query. Merges with per-topic memory from sub-agents. |
-| `synthesize` | LLM builds structured report (Executive Summary → Findings → Analysis → Conclusion → Notes) with inline source markers. |
-
-### Sub-Agent Subgraph (one instance per sub-task)
-
-```
-sub_search → sub_fetch → sub_analyze → sub_memory → END
-```
-
-| Node | Role |
-|---|---|
-| `sub_search` | Calls `search_web()` (DDG with Jina fallback) for the sub-task query. Deduplicates + embedding-reranks. |
-| `sub_fetch` | Parallel trafilatura fetch of up to `max_pages` pages. Async with `asyncio.gather` + semaphore. Truncates at `MAX_PAGE_CHARS`. |
-| `sub_analyze` | LLM extracts grounded facts per page via structured output. Facts tagged `[Topic: X]`. |
-| `sub_memory` | Per-topic Chroma query with sub-task query + focus. Writes fetched content with topic-enriched metadata. |
-
-### Research Rounds & Iteration
-
-- **Round 1:** Initial plan → sub-agents research → aggregate → should_continue checks coverage
-- **Round 2+:** should_continue generates new sub-tasks targeting gaps → plan → sub-agents research → aggregate → check
-- **Facts accumulate across rounds** via `operator.add` reducers. Old facts are carried forward, not discarded.
-- **Safety:** Hard cap at `MAX_ITERATIONS` (default 5). If reached, forces synthesis with available facts.
+| `plan` | LLM decomposes the user query into 4–5 search queries + key aspects + gaps (YAML output, parsed). |
+| `search` | Runs DuckDuckGo (`run_ddg_search`) for each query. Deduplicates by URL/host, then embedding-reranks with a recency bonus. |
+| `fetch` | Fetches each result page with `trafilatura` in parallel (semaphore-limited). Writes content to Chroma memory. |
+| `analyze` | For each fetched page, an LLM call extracts **structured facts** (`FactItem{claim, source_url}`) via `with_structured_output`. Larger context window than before. |
+| `should_continue` | Heuristic: continues (back to `search`) if too few pages/facts were gathered or gaps remain; otherwise proceeds to `memory` → `synthesize`. Hard cap at `MAX_ITERATIONS`. |
+| `memory` | Global Chroma query with the original user query (+ plan gaps/aspects) for broad context. |
+| `synthesize` | LLM builds a structured report (Executive Summary → Findings → Analysis → Conclusion → Notes) with inline source markers from the extracted facts. |
 
 ---
 
 ## State Model (`ResearchState`)
 
-| Key | Type | Reducer | Purpose |
-|---|---|---|---|
-| `query` | `str` | (overwrite) | Original user question |
-| `sub_tasks` | `List[SubTask]` | (overwrite) | Plan node output; replanned each round |
-| `search_results` | `Annotated[List[Dict], operator.add]` | **accumulate** | Search results from all sub-agents |
-| `fetched_content` | `Annotated[List[Dict], operator.add]` | **accumulate** | Fetched page content from all sub-agents |
-| `extracted_facts` | `Annotated[List[str], operator.add]` | **accumulate** | Facts from all sub-agents, tagged `[Topic: X]` |
-| `sub_agent_errors` | `Annotated[List[str], operator.add]` | **accumulate** | Errors from sub-agents |
-| `aggregated_facts` | `List[str]` | (overwrite) | Deduplicated facts after aggregation |
-| `unique_sources` | `List[str]` | (overwrite) | Deduplicated source URLs |
-| `per_topic_memory` | `List[Dict]` | (overwrite) | Memory from sub-agent per-topic queries |
-| `global_memory` | `List[Dict]` | (overwrite) | Memory from central memory_node |
-| `final_answer` | `str` | (overwrite) | Synthesized report |
-| `sources` | `List[str]` | (overwrite) | Sources cited in report |
-| `iteration` | `int` | (overwrite) | Current research round |
-| `max_iterations` | `int` | (overwrite) | Safety cap (default 5) |
-| `next_step` | `str` | (overwrite) | "continue" or "synthesize" |
-| `coverage_sufficient` | `bool` | (overwrite) | LLM assessment |
-| `plan_gaps` | `List[str]` | (overwrite) | Identified gaps for replanning |
-| `messages` / `errors` | `List[str]` | (overwrite) | Human-readable log |
+Defined as a `TypedDict` (all fields `total=False`) in `state.py`. There are **no** accumulator reducers (e.g. `operator.add`); nodes overwrite the keys they own and the pipeline carries a single growing list of facts via plain reassignment.
 
-### `SubTask`
-
-```python
-class SubTask(TypedDict):
-    task_id: str       # unique ID (uuid4)
-    topic: str         # label, e.g. "Pricing", "Performance"
-    query: str         # focused search query
-    focus: str         # what facts to extract
-    max_pages: int     # page budget (2–8, dynamically allocated by plan LLM)
-```
+| Key | Type | Purpose |
+|---|---|---|
+| `query` | `str` | Original user question |
+| `research_plan` | `Dict[str, Any]` | Parsed plan (SEARCH_QUERIES, KEY_ASPECTS, GAPS_TO_ADDRESS) |
+| `search_queries` | `List[str]` | Queries to run this round (accumulate across iterations) |
+| `search_results` | `List[Dict[str, Any]]` | Reranked search results (url/title/snippet/published_at/score) |
+| `fetched_content` | `List[Dict[str, Any]]` | Fetched pages (url/title/text/metadata) |
+| `extracted_facts` | `List[str]` | Facts as strings, each formatted `claim (source: url)` |
+| `relevant_memory` | `List[Dict[str, Any]]` | Chunks retrieved from Chroma in `memory_node` |
+| `final_answer` | `str` | Synthesized report |
+| `sources` | `List[str]` | Source URLs cited in the report |
+| `iteration` | `int` | Current research round |
+| `max_iterations` | `int` | Safety cap (default 2 in config.py; 5 in `.env`) |
+| `plan_gaps` | `List[str]` | Gaps carried from the plan; drive continuation |
+| `next_step` | `str` | "search" or "synthesize" |
+| `errors` / `messages` | `List[str]` | Human-readable logs |
 
 ---
 
@@ -151,7 +118,7 @@ class SubTask(TypedDict):
 ### Quick Start
 
 ```bash
-# One-time setup
+# One-time setup (installs deps; ensure langchain_ollama is present)
 bash scripts/setup.sh
 
 # Start Ollama
@@ -177,64 +144,78 @@ Apply: `ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b-256k`
 
 Then use `qwen3.5-4b-256k` as `LLM_MODEL` in `.env`.
 
-### Memory Budget (Mac Unified Memory)
-
-| Component | Estimate |
-|---|---|
-| LLM weights (Q4_K_M, 4B) | ~3.5GB |
-| KV cache (256K context, fp16) | ~2.5GB |
-| Embeddings (`nomic-embed-text`) | ~0.5GB |
-| System + overhead | ~2GB |
-| **Total** | **~8.5GB** — fits in 16GB with headroom |
-
 ### Structured Output
 
-Ollama supports structured output via `json_mode` / `function_calling`. All LLM calls that produce structured data use `with_structured_output(PydanticModel)`:
+Fact extraction (`analyze_node`) uses Pydantic `with_structured_output(AnalyzeOutput)` where:
 
 ```python
-class PlanOutput(BaseModel):
-    sub_tasks: list[SubTaskModel]
+class FactItem(BaseModel):
+    claim: str
+    source_url: str
 
-result = await llm.with_structured_output(PlanOutput).ainvoke(prompt)
-# → PlanOutput(sub_tasks=[...]) — typed, no parsing needed
+class AnalyzeOutput(BaseModel):
+    facts: List[FactItem]
 ```
 
-No YAML parsing. No `/no_think` hack. No fallback logic.
+The `plan_node` still uses YAML parsing (a known fragility, see roadmap).
 
 ---
 
 ## Search & Fetch Strategy
 
-### Search: DuckDuckGo + s.jina.ai
+### Search: DuckDuckGo
 
 ```python
 # config.py
-SEARCH_BACKEND = "duckduckgo"  # or "jina", "brave"
-SEARCH_FALLBACK = True          # auto-fallback to Jina when DDG returns < 3 results
+SEARCH_RESULTS_PER_QUERY = 8   # results per query
+SEARCH_RERANK_TOP_N = 10       # keep top-N after embedding rerank
+SEARCH_SINCE_DAYS / SEARCH_DATE_FROM / SEARCH_DATE_TO  # optional recency filters
 ```
 
-DuckDuckGo is primary (free, zero setup). If it returns < 3 results or fails:
-1. Auto-switch to `s.jina.ai` (free, 100 RPM, returns pre-extracted content)
-2. If both fail → return partial, let should_continue replan
+DuckDuckGo is the sole backend (via the `ddgs` library). The earlier `s.jina.ai`/`brave` fallback is **not** wired in the current code.
+
+> **Recency filter note:** `tools._inject_date_filters` appends DuckDuckGo `after:/before:` date tokens when recency is requested. A previous bug that also appended an invalid literal `site:news` token (which silently killed recall) has been **removed**.
 
 ### Fetch: trafilatura
 
 ```python
-text = trafilatura.extract(html, output_format="markdown", favor_precision=True)
+text = trafilatura.extract(
+    downloaded,
+    output_format="markdown",
+    favor_precision=True,
+    include_comments=False,
+    include_tables=False,
+)
 ```
 
-trafilatura uses a multi-extractor pipeline (readability, justext, boilerpy3) to produce clean markdown. No JavaScript rendering — most research content (news, papers, docs) is server-rendered. If JS-heavy pages are needed, a Playwright fallback is on the roadmap.
+- Pages are fetched **in parallel** with `asyncio.gather` + a semaphore (`FETCH_CONCURRENCY`, default 5).
+- Content is truncated to `MAX_PAGE_CHARS` (default 10000).
+- trafilatura produces clean markdown from server-rendered pages. JS-heavy pages may yield poor extraction (Playwright fallback is on the roadmap).
 
 ---
 
 ## Memory Strategy
 
 - **Storage:** Chroma persisted to `./advanced_memory/`. Collection `research_memory`.
-- **Per-topic writes:** Each sub-agent writes fetched content with metadata `{url, title, query, topic, focus, timestamp}`.
-- **Per-topic reads:** Each sub-agent queries Chroma with its sub-task query + focus before analyzing.
-- **Global read:** Memory node queries Chroma with the original user query for broad context.
+- **Writes:** `fetch_node` writes each fetched page's text (split into chunks) with metadata `{url, title, query, timestamp}`.
+- **Reads:** `memory_node` queries Chroma with the original user query (+ aspects/gaps) for broad context before synthesis.
 - **Recency boost:** `1 / (1 + age_hours / 24)` applied to similarity scores.
 - **Persistence:** `add_to_memory()` calls `vectorstore.persist()` after each batch.
+
+> **Caveat:** Because `fetch` writes to Chroma *before* `memory` reads, the memory node may re-retrieve the just-fetched content. This is currently acceptable but means memory acts more as a per-run store than a persistent cross-run knowledge base.
+
+---
+
+## Recent Improvements (quick-win cluster)
+
+Implemented to optimize the existing pipeline without adding nodes:
+
+1. **Parallel fetch** — `fetch_node` now fetches pages concurrently with a semaphore instead of one-at-a-time (`FETCH_CONCURRENCY`, default 5). Large speedup on multi-page rounds.
+2. **trafilatura extraction** — `fetch_url` switched from `requests`+`BeautifulSoup` to `trafilatura` for cleaner, higher-quality markdown (better fact extraction downstream).
+3. **Structured fact extraction** — `analyze_node` uses Pydantic `with_structured_output(AnalyzeOutput)` so each fact carries a `claim` + `source_url`, making facts citable and enabling future deduplication. Includes a plain-text fallback if structured parsing fails.
+4. **Larger analysis context** — analysis snippet per page raised from a hard-coded 1500 chars to `ANALYSIS_SNIPPET_CHARS` (default 4000), so more of each page informs extracted facts.
+5. **Lower analysis temperature** — analysis runs at `ANALYSIS_TEMPERATURE` (default 0.1) for more precise, less speculative facts.
+6. **Date-filter bug fix** — removed the invalid `site:news` token injection that broke recency-filtered searches.
 
 ---
 
@@ -242,30 +223,29 @@ trafilatura uses a multi-extractor pipeline (readability, justext, boilerpy3) to
 
 ### Implemented
 
-- **Monolithic pipeline** (current stable): plan → search → fetch → analyze → should_continue → memory → synthesize. Working end-to-end with all local models.
-- **Memory persistence**: Chroma survives restarts.
-- **LangSmith tracing**: Optional, via env vars.
+- **Monolithic pipeline** (current stable): plan → search → fetch → analyze → should_continue → memory → synthesize. End-to-end with all local models.
+- **Parallel trafilatura fetch** (see Recent Improvements).
+- **Structured fact extraction** with source URLs (see Recent Improvements).
+- **Chroma memory persistence** across runs.
+- **LangSmith tracing**: optional, via env vars.
 
-### In Progress (architectural rewrite)
+### Known Limitations / Not Yet Done
 
-- **Orchestrator + sub-agent architecture** — replacing the monolithic pipeline with parallel fan-out. See HLD.md for full design.
-- **Ollama integration** — using Ollama for both LLM and embeddings on Mac.
-- **trafilatura** — replacing requests+BeautifulSoup with trafilatura for better extraction.
-- **Multi-backend search** — DuckDuckGo + s.jina.ai fallback, configurable.
-- **Structured output** — replacing YAML parsing with Pydantic typed output models.
+- **`plan_node`** still uses fragile YAML parsing instead of Pydantic structured output.
+- **No `s.jina.ai`/`brave` fallback** for search.
+- **No cross-source fact deduplication** — redundant facts may accumulate across pages.
+- **`should_continue`** is heuristic (counts + gap presence), not an LLM coverage assessment. Next-round queries are naive concatenations (`f"{query} {gap}"`).
+- **Memory self-retrieval** (see Memory Strategy caveat).
+- **No Playwright JS fallback** for pages trafilatura can't extract.
 
-### Remaining Improvements (post-rewrite)
+### Future Roadmap (from original design)
 
-1. **Cross-encoder reranking** — Add `sentence-transformers.CrossEncoder` pass after embedding rerank in sub_search_node. Two-stage ranking for higher search precision.
-
-2. **Human-in-the-loop checkpoints** — Pause after plan (approve decomposition) and after sub-agents (review sources). CLI prompts for approve/reject/revise.
-
-3. **Source citation verification** — Map each fact back to its source URL. Post-synthesis HEAD check on cited URLs. Flag broken/hallucinated sources.
-
-4. **Markdown report export** — Export reports as `.md` with YAML frontmatter, proper footnote-style citations, and a references section.
-
-5. **Playwright JS fallback** — Optional trafilatura → Playwright fallback for pages that trafilatura can't extract cleanly.
-
-6. **Gradio web UI** — Browser-based interface with streaming research progress and report display.
-
-7. **Embedding fallback to CPU** — Under tight VRAM, fall back to CPU-based embedding to avoid OOM during bulk fetches.
+1. **Orchestrator + sub-agent architecture** — replace the monolithic pipeline with parallel `Send` fan-out sub-agents. (This is the big architectural rewrite; not started in code.)
+2. **Cross-encoder reranking** — two-stage ranking after embedding rerank in `search`.
+3. **Human-in-the-loop checkpoints** — pause after plan and after fetch for approve/reject/revise.
+4. **Source citation verification** — map each fact to its source URL (partially enabled by structured facts) and HEAD-check cited URLs.
+5. **Markdown report export** — `.md` with frontmatter + references.
+6. **Gradio web UI** — browser interface with streaming.
+7. **Embedding fallback to CPU** — avoid OOM under tight memory.
+8. **Playwright JS fallback** for trafilatura misses.
+9. **Jina/Brave search fallback** and **Pydantic plan output**.

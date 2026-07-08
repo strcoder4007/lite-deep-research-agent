@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,6 +8,7 @@ from urllib.parse import urlparse
 
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from . import config
 from .memory import add_to_memory, query_memory
@@ -167,58 +169,103 @@ def search_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
 
 
 def fetch_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
-    fetched: List[Dict[str, Any]] = []
     to_visit = state.get("search_results", [])[: config.FETCH_LIMIT]
-    for item in to_visit:
-        url = item["url"]
-        resp = fetch_url(url)
-        if not resp:
+
+    async def _fetch_all(items: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+        sem = asyncio.Semaphore(config.FETCH_CONCURRENCY)
+
+        async def _fetch_one(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            url = item.get("url")
+            if not url:
+                return None
+            async with sem:
+                resp = await asyncio.to_thread(fetch_url, url, config.REQUEST_TIMEOUT)
+            if not resp:
+                return None
+            title, text = resp
+            return {
+                "url": url,
+                "title": title,
+                "text": text,
+                "query": item.get("query") or state.get("query"),
+            }
+
+        return await asyncio.gather(*[_fetch_one(it) for it in items])
+
+    results = asyncio.run(_fetch_all(to_visit))
+    fetched: List[Dict[str, Any]] = []
+    for res in results:
+        if not res:
             continue
-        title, text = resp
         metadata = {
-            "url": url,
-            "title": title,
-            "query": item.get("query") or state.get("query"),
+            "url": res["url"],
+            "title": res["title"],
+            "query": res["query"],
             "timestamp": timestamp(),
         }
-        add_to_memory(tools, text, metadata)
-        fetched.append({"url": url, "title": title, "text": text, "metadata": metadata})
+        add_to_memory(tools, res["text"], metadata)
+        fetched.append({
+            "url": res["url"],
+            "title": res["title"],
+            "text": res["text"],
+            "metadata": metadata,
+        })
     append_message(state, f"Fetched {len(fetched)} pages.")
     return {"fetched_content": fetched, "messages": state.get("messages", [])}
+
+
+class FactItem(BaseModel):
+    claim: str = Field(description="A single concise, grounded fact answering the user query")
+    source_url: str = Field(description="URL of the source page the fact was drawn from")
+
+
+class AnalyzeOutput(BaseModel):
+    facts: List[FactItem] = Field(default_factory=list)
 
 
 def analyze_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
     query = state["query"]
     facts: List[str] = []
+    analyzer = tools.llm.bind(temperature=config.ANALYSIS_TEMPERATURE)
+    structured = analyzer.with_structured_output(AnalyzeOutput)
     for doc in state.get("fetched_content", []):
-        snippet = doc["text"][:1500]
+        snippet = doc["text"][: config.ANALYSIS_SNIPPET_CHARS]
         prompt = [
             SystemMessage(
-                content=_with_no_think(
-                    "Extract only grounded, concise facts that answer the user query.\n"
-                    "- Return bullet-style lines, one fact per line.\n"
-                    "- Start each fact with the source title in brackets, e.g., [Title] fact...\n"
-                    "- Use exact numbers/names from the text; no speculation or opinions.\n"
-                    "- Skip content that is off-topic or redundant.\n"
+                content=(
+                    "You are a precise research analyst. Extract only grounded, concise facts that "
+                    "answer the user query.\n"
+                    "Rules:\n"
+                    "- Each fact must be a single standalone sentence using exact numbers/names from the text.\n"
+                    "- No speculation, opinions, or off-topic content.\n"
+                    "- Output structured facts; each fact must carry the source page URL.\n"
+                    f"Source page URL: {doc['url']}\n"
+                    "Respond with the structured facts only. /no_think"
                 )
             ),
             HumanMessage(
-                content=_with_no_think(
+                content=(
                     f"User query: {query}\n"
-                    f"Source: {doc['title']}\n"
+                    f"Source title: {doc['title']}\n"
                     "From the content below, pull only the most relevant facts (ignore the rest):\n"
                     f"{snippet}"
                 )
             ),
         ]
         try:
-            response = tools.llm.invoke(prompt).content
-            lines = [line.strip(" -") for line in response.splitlines() if line.strip()]
-            for line in lines:
-                if line:
-                    facts.append(line)
+            result = structured.invoke(prompt)
+            for f in result.facts:
+                url = f.source_url or doc["url"]
+                facts.append(f"{f.claim} (source: {url})")
         except Exception as exc:
-            append_error(state, f"Analysis failed for {doc.get('url')}: {exc}")
+            append_error(state, f"Structured analysis failed for {doc.get('url')}: {exc}")
+            try:
+                response = analyzer.invoke(prompt).content
+                lines = [line.strip(" -") for line in response.splitlines() if line.strip()]
+                for line in lines:
+                    facts.append(f"{line} (source: {doc['url']})")
+            except Exception as exc2:
+                append_error(state, f"Analysis failed for {doc.get('url')}: {exc2}")
     append_message(state, f"Extracted {len(facts)} facts.")
     return {"extracted_facts": facts, "messages": state.get("messages", []), "errors": state.get("errors", [])}
 

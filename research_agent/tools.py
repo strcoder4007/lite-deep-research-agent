@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-import requests
-from bs4 import BeautifulSoup
 from langsmith import traceable
 try:  # prefer new package name
     from ddgs import DDGS
@@ -27,6 +25,8 @@ try:
 except ImportError:
     from langchain_community.vectorstores import Chroma
 from langchain_core.language_models.chat_models import BaseChatModel
+
+import trafilatura
 
 from . import config
 
@@ -112,9 +112,6 @@ def _inject_date_filters(query: str, since_days: int = 0, date_from: Optional[st
         tokens.append(f"after:{date_from}")
     if date_to:
         tokens.append(f"before:{date_to}")
-    if tokens:
-        # Nudge toward current coverage when recency is requested
-        tokens.append("site:news")
     if not tokens:
         return query
     return f"{query} {' '.join(tokens)}"
@@ -165,28 +162,25 @@ def run_ddg_search(
 
 @traceable(run_type="retriever", name="Fetch URL")
 def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple[str, str]]:
-    headers = {
-        "User-Agent": "lite-research-agent/0.1 (+https://github.com/)",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
     try:
-        response = requests.get(url, timeout=timeout, headers=headers)
-        response.raise_for_status()
+        downloaded = trafilatura.fetch_url(url, timeout=timeout)
     except Exception:
         return None
-    content_type = response.headers.get("Content-Type", "")
-    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+    if not downloaded:
         return None
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-        tag.decompose()
-    text = soup.get_text(separator=" ", strip=True)
-    text = " ".join(text.split())
+    text = trafilatura.extract(
+        downloaded,
+        output_format="markdown",
+        favor_precision=True,
+        include_comments=False,
+        include_tables=False,
+    )
     if not text:
         return None
     if len(text) > config.MAX_PAGE_CHARS:
         text = text[: config.MAX_PAGE_CHARS]
-    title = soup.title.string.strip() if soup.title and soup.title.string else url
+    metadata = trafilatura.extract_metadata(downloaded)
+    title = (metadata.title.strip() if metadata and metadata.title else None) or url
     return title, text
 
 

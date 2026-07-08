@@ -35,6 +35,11 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 # Timeouts and caps
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "5000"))
+FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "5"))
+
+# Analysis
+ANALYSIS_SNIPPET_CHARS = int(os.getenv("ANALYSIS_SNIPPET_CHARS", "4000"))
+ANALYSIS_TEMPERATURE = float(os.getenv("ANALYSIS_TEMPERATURE", "0.1"))
 
 # Conditional loop defaults
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "2"))
