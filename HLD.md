@@ -337,3 +337,78 @@ lite-deep-research-agent/
 | P3 | `s.jina.ai` / `brave` search fallback | ⬜ |
 | P3 | Source URL accessibility verification (HEAD checks) | ⬜ |
 | P3 | Embedding fallback to CPU | ⬜ |
+
+---
+
+## 13. Open Items (detailed)
+
+This section expands on the not-yet-implemented improvements ("remaining improvements") identified while optimizing the pipeline. They are ordered roughly by impact on research quality. None require adding new graph nodes — most are within existing nodes, plus a few architectural items.
+
+### 13.1 Pydantic structured output for `plan_node` (replace YAML)
+- **Where:** `plan_node` in `nodes.py` (currently parses YAML via `yaml.safe_load` with `_parse_plan`).
+- **Why:** YAML parsing is fragile — small model deviations (code fences, indentation) break the plan and force a fallback to the raw query. The handoff explicitly calls for no YAML parsing.
+- **What:** Use `tools.llm.with_structured_output(PlanOutput)` returning `search_queries`, `key_aspects`, `gaps_to_address`. Adds robustness and removes the `NO_THINK_FLAG`/`_with_no_think` hack.
+
+### 13.2 LLM-driven coverage assessment in `should_continue` (replace heuristic)
+- **Where:** `should_continue_node` in `nodes.py` (currently counts `fetched < 3`, `facts < 5`, or `plan_gaps`).
+- **Why:** Pure thresholds don't measure *coverage* — redundant facts can satisfy the count while real gaps remain, or vice versa. Next-round queries are naive concatenations (`f"{query} {gap}"`).
+- **What:** Add an LLM call (structured output) that reads the extracted facts + gaps and decides `coverage_sufficient` plus *refined* follow-up queries targeting the actual gap (not string concat). Keep the `MAX_ITERATIONS` hard cap.
+
+### 13.3 Cross-source fact deduplication
+- **Where:** after `analyze_node` (or in `should_continue`), before synthesis.
+- **Why:** Facts accumulate across pages with no merging; near-duplicate facts from different sources inflate the report and waste context.
+- **What:** Embed each fact and drop near-duplicates above a cosine threshold (e.g. 0.85), mirroring the original `aggregate_node` design. The structured `source_url` per fact makes keeping a canonical source trivial.
+
+### 13.4 Memory self-retrieval fix
+- **Where:** graph edges / ordering in `graph.py` + `memory_node` in `nodes.py`.
+- **Why:** `fetch_node` writes pages to Chroma *before* `memory_node` reads, so the memory node largely re-retrieves the just-fetched content rather than genuinely prior knowledge.
+- **What:** Query memory *before* fetch (so it reflects prior runs), or tag writes with the current run id and exclude them from the memory read. Makes memory a real cross-run knowledge base.
+
+### 13.5 Better analysis context & cross-source reconciliation
+- **Where:** `analyze_node` in `nodes.py`.
+- **Why:** Each page is still analyzed in isolation with only `ANALYSIS_SNIPPET_CHARS` (4000) of context. Contradictions/redundancy across sources aren't reconciled, and large pages are truncated.
+- **What:** Pass already-extracted facts from prior pages as context so later pages can corroborate/conflict; consider feeding more of each page now that 256K context is available. Optionally raise `ANALYSIS_SNIPPET_CHARS`.
+
+### 13.6 `s.jina.ai` / `brave` search fallback
+- **Where:** `run_ddg_search` in `tools.py` (+ `SEARCH_BACKEND`/`SEARCH_FALLBACK` config).
+- **Why:** Current code uses DuckDuckGo only. When DDG returns < 3 results or errors, the run degrades instead of recovering.
+- **What:** Implement the auto-fallback chain (DDG → s.jina.ai → partial) described in the original design, with `SEARCH_BACKEND` and `SEARCH_FALLBACK` wired through `config.py`.
+
+### 13.7 Cross-encoder reranking for search results
+- **Where:** `search_node` rerank step (`_rerank_results`) in `nodes.py`.
+- **Why:** Single-stage embedding rerank is decent but a cross-encoder second pass improves precision, especially for ambiguous queries.
+- **What:** Add a `sentence-transformers.CrossEncoder` pass after embedding rerank (two-stage ranking). Adds a model dependency; gate behind a config flag.
+
+### 13.8 Source citation verification
+- **Where:** post-synthesis (new helper, no new node needed) + `synthesize_node`.
+- **Why:** Facts now carry `source_url`, but cited URLs are never validated; a dead/hallucinated source can slip into the report.
+- **What:** After synthesis, HEAD-check each cited URL; flag broken ones and note uncertainty in the report's Notes section.
+
+### 13.9 Markdown report export with references
+- **Where:** `cli.py` / `agent.py` output handling.
+- **Why:** Reports are currently saved as flat `.txt` with a sources list.
+- **What:** Emit `.md` with YAML frontmatter, footnote-style citations, and a References section, using the `source_url` already attached to each fact.
+
+### 13.10 Playwright JS fallback for trafilatura misses
+- **Where:** `fetch_url` in `tools.py`.
+- **Why:** trafilatura can't extract JS-heavy pages; those silently return no text.
+- **What:** On empty trafilatura extraction, fall back to a headless Playwright render. Optional dependency; gate behind a config flag.
+
+### 13.11 Human-in-the-loop checkpoints
+- **Where:** CLI flow (`cli.py`) around `plan` and after `fetch`.
+- **Why:** No opportunity to steer decomposition or review sources before synthesis.
+- **What:** Pause for approve/reject/revise on the plan and on the fetched source list.
+
+### 13.12 Gradio web UI
+- **Why:** No browser interface; current usage is a terminal REPL.
+- **What:** Add a Gradio app with streaming research progress and report display.
+
+### 13.13 Embedding fallback to CPU
+- **Where:** `create_embedder` in `tools.py`.
+- **Why:** Under tight VRAM during bulk fetches, embedding on GPU can OOM.
+- **What:** Detect VRAM pressure and fall back to CPU embeddings.
+
+### 13.14 Orchestrator + parallel sub-agent `Send` fan-out (biggest architectural item)
+- **Where:** new `sub_agent.py` subgraph + `graph.py` composition (not started in code).
+- **Why:** The original design goal — decompose into sub-topics and research them concurrently for breadth and speed.
+- **What:** Introduce `SubTask`, `sub_search/sub_fetch/sub_analyze/sub_memory` nodes, `operator.add` reducers, and a `research_round` subgraph fanning out via `Send`. This is the largest change and is intentionally deferred; all items above are achievable on the current monolithic pipeline first.
