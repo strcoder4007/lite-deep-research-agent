@@ -1,60 +1,53 @@
 # Lite Deep Research Agent
 
-Local deep research agent built on LangGraph. The orchestrator decomposes a user query into sub-topics, spawns parallel sub-agents to research each one, iterates when coverage is insufficient, and synthesizes a grounded, sourced report. Everything runs locally via Ollama.
+Local deep research agent built on LangGraph. It plans search queries from a
+user question, searches the web, fetches and extracts page content, iterates
+when coverage is thin, and synthesizes a grounded, sourced report.
+
+The LLM runs locally via an **OpenAI-compatible server** (`mlx_lm.server`,
+Apple Silicon). Embeddings run **in-process** via HuggingFace
+sentence-transformers. No cloud APIs, no Ollama.
+
+## Prerequisites
+
+- **Apple Silicon Mac** (M1/M2/M3/M4/M5) with ~16 GB unified memory
+- **Python 3.10+**
+- **`mlx-lm >= 0.31`** (older releases don't support the `qwen3_5` architecture)
 
 ## Quick Start
 
 ```bash
-# 1. Start Ollama (if not already running)
-ollama serve
+# 1. Install Python dependencies
+pip install -r requirements.txt
 
-# 2. One-time setup (pull models)
-bash scripts/setup.sh
+# 2. Install / upgrade mlx-lm (the model needs a recent version)
+pip install --upgrade mlx-lm
 
-# 3. Run the agent
+# 3. Start the LLM server (downloads the model on first run, ~8.5 GB)
+#    IMPORTANT: keep thinking disabled — see note below.
+mlx_lm.server \
+  --model "prism-ml/Ternary-Bonsai-27B-mlx-2bit" \
+  --port 8080 \
+  --chat-template-args '{"enable_thinking":false}'
+
+# 4. In another terminal, run the agent
 python -m research_agent
 ```
 
-## Architecture
-
-```
-Orchestrator sends sub-tasks to parallel sub-agents, iterates until sufficient coverage
-
-  user query
-      │
-  ┌───▼────┐    ┌───────────────┐    ┌───────────┐    ┌────────────────┐
-  │  plan  │───▶│ research_round│───▶│ aggregate │───▶│should_continue │
-  │(decomp)│    │  (N parallel  │    │(dedup +   │    │ (LLM assesses  │
-  │        │    │   sub-agents) │    │ merge)    │    │  coverage)     │
-  └────────┘    └───────┬───────┘    └───────────┘    └───┬──────┬─────┘
-                        │                         "continue"│      │"synthesize"
-              ┌─────────┼─────────┐                ┌───────┘      ▼
-              ▼         ▼         ▼                │         ┌──────────┐
-         sub_agent  sub_agent  sub_agent           │         │  memory  │
-         search       search     search            │         └────┬─────┘
-           │            │          │               │              ▼
-         fetch        fetch      fetch             │         ┌──────────┐
-           │            │          │               │         │synthesize│
-        analyze      analyze    analyze            │         └────┬─────┘
-           │            │          │               │              ▼
-       per-topic    per-topic  per-topic           └── replan    END
-        memory       memory     memory
-```
-
-- **plan** — LLM decomposes query into 3–5 sub-tasks with dynamic page budgets (2–8 pages each)
-- **research_round** — `Send` fan-out spawns N parallel sub-agents. Each runs search → trafilatura fetch → LLM fact extraction → per-topic Chroma query. Outputs merge via `operator.add` reducers.
-- **aggregate** — Deduplicates facts (cosine similarity 0.85) and sources
-- **should_continue** — LLM assesses coverage. If insufficient, generates focused follow-up sub-tasks. Safety cap at `MAX_ITERATIONS` (default 5).
-- **memory** — Global Chroma query with original query
-- **synthesize** — Builds structured report (Executive Summary → Findings → Analysis → Conclusion → Notes) with inline source markers
+> **Why `enable_thinking:false`?** This is a reasoning model. When thinking is
+> enabled, the OpenAI `/v1` response returns the reasoning trace in a
+> non-standard `reasoning` field and leaves `content` empty — and LangChain's
+> `ChatOpenAI` client drops that field, so fact extraction gets nothing.
+> Disabling thinking makes the model answer directly (fast, `content` always
+> populated). The flag is only honored at server launch, not per-request.
 
 ## Run
 
 ```bash
-# Interactive REPL (pick from examples or type a custom query)
+# Interactive REPL (type a query)
 python -m research_agent
 
-# With streaming node-by-node progress (default)
+# Node-by-node timing (default)
 python -m research_agent --verbose
 
 # Custom iteration limit
@@ -63,27 +56,93 @@ python -m research_agent --iterations 3
 
 Reports are saved to `reports/report_<hash>.txt`.
 
-### LangSmith Tracing
+## Architecture
 
-Set in `.env`:
-```bash
-LANGSMITH_TRACING_V2=true
-LANGSMITH_API_KEY=<your-key>
-LANGSMITH_PROJECT=lite-deep-research
+A single sequential LangGraph `StateGraph` pipeline (monolithic; `fetch`
+parallelizes its own I/O internally):
+
 ```
+plan → search → fetch → analyze → should_continue ──"synthesize"──▶ memory → synthesize → END
+                          ▲                          │
+                          └────────"search"──────────┘  (loop back, capped at MAX_ITERATIONS)
+```
+
+- **plan** — LLM decomposes the query into 4–5 search queries + key aspects + gaps.
+- **search** — DuckDuckGo (`ddgs`) per query, dedup by URL/host, embedding rerank with a recency bonus.
+- **fetch** — parallel `trafilatura` fetch (semaphore-limited), writes each page to Chroma memory.
+- **analyze** — per-page LLM fact extraction; each fact carries a `source_url`. JSON is parsed defensively (tolerates code fences / schema drift).
+- **should_continue** — heuristic loop: continue if too few pages/facts or gaps remain; otherwise proceed. Hard cap at `MAX_ITERATIONS`.
+- **memory** — Chroma query with the original query (+ gaps/aspects) for broad context.
+- **synthesize** — structured report (Executive Summary → Findings → Analysis → Conclusion → Notes) with inline source markers.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Agent framework | LangGraph (`StateGraph`, `Send` fan-out, subgraph composition) |
-| LLM | `qwen3.5:4b` via Ollama (256K context) |
-| Embeddings | `nomic-embed-text` via Ollama (768d) |
+| Agent framework | LangGraph (`StateGraph`, sequential pipeline) |
+| LLM | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` via `mlx_lm.server` (OpenAI-compatible) |
+| LLM client | `langchain_openai.ChatOpenAI` pointed at the local server |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` in-process via `langchain_huggingface` (384d) |
 | Vector DB | Chroma (persisted to `./advanced_memory/`) |
-| Search | DuckDuckGo with `s.jina.ai` auto-fallback |
-| Fetch | `trafilatura` (multi-extractor, clean markdown) |
-| Structured output | Pydantic via `with_structured_output()` |
+| Search | DuckDuckGo (`ddgs`) |
+| Fetch | `trafilatura` (clean markdown) |
 | Tracing | LangSmith (optional) |
+
+## Configuration
+
+Edit `.env` directly. Key settings:
+
+```bash
+# LLM (OpenAI-compatible server)
+LLM_MODEL=prism-ml/Ternary-Bonsai-27B-mlx-2bit
+LLM_BASE_URL=http://localhost:8080/v1
+LLM_API_KEY=not-needed
+LLM_NUM_CTX=262144            # native context; documentation only (no server flag)
+LLM_TIMEOUT=180               # seconds; LLM request timeout
+
+# Embeddings (in-process)
+EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+
+# Search / fetch
+SEARCH_RESULTS_PER_QUERY=8
+FETCH_LIMIT=15
+MAX_PAGE_CHARS=10000
+FETCH_CONCURRENCY=5
+
+# Iteration
+MAX_ITERATIONS=5
+MIN_FACTS_FOR_STOP=5
+
+# Memory
+MEMORY_DIR=advanced_memory
+CHUNK_SIZE=1000
+MEMORY_SIMILARITY_THRESHOLD=0.35
+```
+
+### LangSmith Tracing (optional)
+
+```bash
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=<your-key>
+LANGCHAIN_PROJECT=lite-deep-research
+```
+
+## Memory Budget (Apple Silicon, 4-bit KV cache)
+
+| Component | 64K ctx | 256K ctx |
+|---|---|---|
+| LLM weights (27B ternary 2-bit, MLX) | 7.57 GB | 7.57 GB |
+| KV cache (4-bit, 16 full-attn layers) | 1.07 GB | 4.30 GB |
+| Linear-attention state (48 layers, fixed) | 0.08 GB | 0.08 GB |
+| Embeddings (in-process, MiniLM) | 0.24 GB | 0.24 GB |
+| Runtime overhead | 1.30 GB | 1.30 GB |
+| **Total** | **~10.3 GB** | **~13.5 GB** |
+
+> The model's native context is 262K (256K). Even the full window fits ~13.5 GB
+> on a 16 GB Mac with the 4-bit KV cache, so there's no need to cap context.
+
+> **Performance:** this 2-bit 27B runs at roughly ~18–26 tok/s on M-series, so
+> multi-page research runs can take a while — that's the model, not the pipeline.
 
 ## Project Structure
 
@@ -93,69 +152,22 @@ lite-deep-research-agent/
 ├── handoff.md              # Project handoff reference
 ├── README.md               # This file
 ├── requirements.txt
-├── .env                    # Configuration (copy from .env.example or edit directly)
+├── .env                    # Configuration (edit directly)
 │
 ├── research_agent/
 │   ├── __init__.py
-│   ├── __main__.py         # Entry point
+│   ├── __main__.py         # Entry point (loads .env, runs CLI)
 │   ├── config.py           # All env-read constants
-│   ├── llm.py              # ChatOllama + OllamaEmbeddings factories, ResearchTools
-│   ├── state.py            # ResearchState, SubTask, reducers, helpers
-│   ├── search.py           # search_web() — multi-backend with DDG→Jina fallback
-│   ├── fetch.py            # trafilatura async wrapper, parallel fetch_pages()
+│   ├── tools.py            # LLM/embedder/vectorstore factories, DDG search,
+│   │                       #   trafilatura fetch, JSON-extraction helper
+│   ├── state.py            # ResearchState, helpers
 │   ├── memory.py           # Chroma add/query with recency boosting
-│   ├── sub_agent.py        # Sub-agent subgraph + sub_search/fetch/analyze/memory nodes
-│   ├── nodes.py            # Orchestrator nodes: plan, aggregate, should_continue, memory, synthesize
-│   ├── graph.py            # create_research_graph() — composes parent + subgraph
-│   ├── agent.py            # AdvancedResearchAgent — async generator with streaming
-│   └── cli.py              # Async REPL with streaming output
+│   ├── nodes.py            # Orchestrator nodes (plan/search/fetch/analyze/...)
+│   ├── graph.py            # create_research_graph() — compiles the pipeline
+│   ├── agent.py            # AdvancedResearchAgent — synchronous stream + logging
+│   └── cli.py              # Interactive REPL, saves report to reports/
 │
 └── scripts/
-    ├── setup.sh            # One-time: pip install + ollama pull
-    └── serve.sh            # Launch Ollama
+    ├── setup.sh            # pip install helper
+    └── serve.sh            # Launch the LLM server
 ```
-
-## Configuration
-
-Edit `.env` directly. Key settings:
-
-```bash
-# Ollama models
-LLM_MODEL=qwen3.5:4b           # LLM model (256K context)
-EMBED_MODEL=nomic-embed-text   # Embedding model (768d)
-LLM_NUM_CTX=262144             # Context window size
-
-# Search
-SEARCH_BACKEND=duckduckgo      # duckduckgo | jina | brave
-SEARCH_FALLBACK=1               # DDG → Jina auto-fallback
-
-# Sub-agent behavior
-MAX_SUB_TASKS=5                 # max sub-tasks per plan
-MAX_ITERATIONS=5                # max research rounds
-MAX_PAGE_CHARS=10000            # chars per fetched page
-
-# Memory
-MEMORY_DIR=advanced_memory
-CHUNK_SIZE=1000
-MEMORY_SIMILARITY_THRESHOLD=0.35
-```
-
-## Memory Strategy
-
-Chroma persists to `./advanced_memory/` across runs. Each sub-agent:
-- **Writes** fetched content with metadata `{url, title, query, topic, focus, timestamp}`
-- **Reads** per-topic memory before analyzing (sub-task query + focus)
-- Recency boost: `1 / (1 + age_hours / 24)` applied to similarity scores
-
-The central memory node queries with the original user query for broad context before synthesis.
-
-## Key Design Decisions
-
-| Decision | Choice | Why |
-|---|---|---|
-| Parallelism | LangGraph `Send` fan-out | Graph-visible, async-native, automatic reducer merging |
-| Fetch | trafilatura | Clean markdown output, zero Chromium overhead |
-| Search | DDG + Jina fallback | Free, resilient to DDG API changes |
-| Decomposition | LLM structured output | Typed `SubTask` objects, no YAML parsing |
-| Iteration | LLM-driven coverage assessment | Generates targeted follow-up sub-tasks, not naive string concat |
-| Context | 256K via `num_ctx` | Ollama supports large contexts on Mac with Metal/MLX |

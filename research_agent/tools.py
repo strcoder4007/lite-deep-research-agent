@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -15,11 +16,15 @@ try:  # langchain 0.3+
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ImportError:  # fallback for older langchain versions
     from langchain.text_splitter import RecursiveCharacterTextSplitter
-try:  # prefer modern packages
-    from langchain_ollama import OllamaEmbeddings, ChatOllama
+try:  # OpenAI-compatible chat endpoint (mlx_lm.server, llama.cpp, vLLM, etc.)
+    from langchain_openai import ChatOpenAI
 except ImportError:  # fallback to community if older
-    from langchain_community.embeddings import OllamaEmbeddings  # type: ignore
-    from langchain_ollama import ChatOllama
+    from langchain_community.chat_models import ChatOpenAI  # type: ignore
+try:  # local in-process embeddings (no server required)
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:  # fallback to community if older
+    from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+from langchain_core.embeddings import Embeddings
 try:
     from langchain_chroma import Chroma
 except ImportError:
@@ -34,7 +39,7 @@ from . import config
 @dataclass
 class ResearchTools:
     llm: BaseChatModel
-    embedder: OllamaEmbeddings
+    embedder: Embeddings
     vectorstore: Chroma
     text_splitter: RecursiveCharacterTextSplitter
 
@@ -44,20 +49,22 @@ def create_llm(
     temperature: float = config.LLM_TEMPERATURE,
     max_tokens: int = config.LLM_MAX_TOKENS,
 ) -> BaseChatModel:
-    return ChatOllama(
+    return ChatOpenAI(
         model=model,
+        base_url=config.LLM_BASE_URL,
+        api_key=config.LLM_API_KEY,
         temperature=temperature,
         max_tokens=max_tokens,
-        num_thread=4,
-        verbose=False,
+        timeout=config.LLM_TIMEOUT,
+        max_retries=2,
     )
 
 
-def create_embedder(model: str = config.EMBED_MODEL) -> OllamaEmbeddings:
-    return OllamaEmbeddings(model=model)
+def create_embedder(model: str = config.EMBED_MODEL) -> Embeddings:
+    return HuggingFaceEmbeddings(model_name=model)
 
 
-def create_vectorstore(embedder: OllamaEmbeddings) -> Chroma:
+def create_vectorstore(embedder: Embeddings) -> Chroma:
     config.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     return Chroma(
         embedding_function=embedder,
@@ -186,6 +193,60 @@ def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple
 
 def timestamp() -> str:
     return datetime.utcnow().isoformat()
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Best-effort extraction of the first JSON object from an LLM response.
+
+    Handles the common cases where the model wraps JSON in markdown code
+    fences (```json ... ```) or emits prose around it. Returns None if no
+    balanced JSON object can be found.
+    """
+    if not text:
+        return None
+    cleaned = text.strip()
+    # Strip markdown code fences if present.
+    if cleaned.startswith("```"):
+        # drop the opening fence line (``` or ```json)
+        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: -3]
+        cleaned = cleaned.strip()
+    # Try direct parse first.
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+    # Find the first balanced {...} span.
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = cleaned[start : i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return None
+    return None
 
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:

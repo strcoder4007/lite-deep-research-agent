@@ -8,18 +8,18 @@ from urllib.parse import urlparse
 
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
 
 from . import config
 from .memory import add_to_memory, query_memory
 from .state import ResearchState, append_error, append_message
-from .tools import ResearchTools, cosine_similarity, fetch_url, run_ddg_search, timestamp
-
-NO_THINK_FLAG = "/no_think"
-
-
-def _with_no_think(text: str) -> str:
-    return f"{text}\n{NO_THINK_FLAG}"
+from .tools import (
+    ResearchTools,
+    _extract_json_object,
+    cosine_similarity,
+    fetch_url,
+    run_ddg_search,
+    timestamp,
+)
 
 
 def _parse_plan(raw_text: str) -> Tuple[Dict[str, Any], List[str]]:
@@ -214,20 +214,10 @@ def fetch_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
     return {"fetched_content": fetched, "messages": state.get("messages", [])}
 
 
-class FactItem(BaseModel):
-    claim: str = Field(description="A single concise, grounded fact answering the user query")
-    source_url: str = Field(description="URL of the source page the fact was drawn from")
-
-
-class AnalyzeOutput(BaseModel):
-    facts: List[FactItem] = Field(default_factory=list)
-
-
 def analyze_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
     query = state["query"]
     facts: List[str] = []
     analyzer = tools.llm.bind(temperature=config.ANALYSIS_TEMPERATURE)
-    structured = analyzer.with_structured_output(AnalyzeOutput)
     for doc in state.get("fetched_content", []):
         snippet = doc["text"][: config.ANALYSIS_SNIPPET_CHARS]
         prompt = [
@@ -238,9 +228,10 @@ def analyze_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
                     "Rules:\n"
                     "- Each fact must be a single standalone sentence using exact numbers/names from the text.\n"
                     "- No speculation, opinions, or off-topic content.\n"
-                    "- Output structured facts; each fact must carry the source page URL.\n"
+                    "- Respond with ONLY a JSON object of the form "
+                    '{"facts": [{"claim": "...", "source_url": "..."}]} and nothing else.\n'
                     f"Source page URL: {doc['url']}\n"
-                    "Respond with the structured facts only. /no_think"
+                    "Do not wrap the JSON in code fences or add commentary."
                 )
             ),
             HumanMessage(
@@ -253,16 +244,32 @@ def analyze_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any]:
             ),
         ]
         try:
-            result = structured.invoke(prompt)
-            for f in result.facts:
-                url = f.source_url or doc["url"]
-                facts.append(f"{f.claim} (source: {url})")
+            raw = analyzer.invoke(prompt).content or ""
+            data = _extract_json_object(raw)
+            if data:
+                items = data.get("facts") or data.get("fact") or []
+                if isinstance(items, dict):
+                    items = [items]
+                for f in items:
+                    if not isinstance(f, dict):
+                        continue
+                    claim = (f.get("claim") or "").strip()
+                    if not claim:
+                        continue
+                    url = f.get("source_url") or f.get("source") or f.get("url") or doc["url"]
+                    facts.append(f"{claim} (source: {url})")
+                if facts:
+                    continue
+            # Fallback: treat raw lines as plain facts.
+            raise ValueError("no structured facts parsed")
         except Exception as exc:
             append_error(state, f"Structured analysis failed for {doc.get('url')}: {exc}")
             try:
-                response = analyzer.invoke(prompt).content
+                response = analyzer.invoke(prompt).content or ""
                 lines = [line.strip(" -") for line in response.splitlines() if line.strip()]
                 for line in lines:
+                    if line.startswith("{") or line.startswith("```"):
+                        continue
                     facts.append(f"{line} (source: {doc['url']})")
             except Exception as exc2:
                 append_error(state, f"Analysis failed for {doc.get('url')}: {exc2}")
@@ -313,7 +320,7 @@ def synthesize_node(state: ResearchState, tools: ResearchTools) -> Dict[str, Any
             )
         ),
     ]
-    synth_llm = tools.llm.bind()
+    synth_llm = tools.llm.bind(max_tokens=config.LLM_SYNTHESIS_MAX_TOKENS)
     response = synth_llm.invoke(prompt).content
     return {
         "final_answer": response,

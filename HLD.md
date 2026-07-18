@@ -4,14 +4,14 @@
 
 ## 1. System Overview
 
-**lite-deep-research-agent** is a local deep-research agent built on LangGraph. It plans search queries from a user question, searches the web, fetches and extracts content, iterates when coverage is thin, and synthesizes a grounded, sourced report. Everything runs locally via Ollama (LLM + embeddings).
+**lite-deep-research-agent** is a local deep-research agent built on LangGraph. It plans search queries from a user question, searches the web, fetches and extracts content, iterates when coverage is thin, and synthesizes a grounded, sourced report. The LLM is served locally by an OpenAI-compatible server (`mlx_lm.server`); embeddings run locally in-process via HuggingFace.
 
 ### Design Goals
 
 | Goal | How (current) |
 |---|---|
-| **Lightweight** | Small Ollama model (4B-class), local embeddings, zero cloud dependencies |
-| **Local-first** | Ollama serves both LLM and embeddings; Chroma for memory; no external APIs |
+| **Lightweight** | Small local MLX model (ternary 2-bit), local in-process embeddings, zero cloud dependencies |
+| **Local-first** | `mlx_lm.server` serves the LLM; HuggingFace embeddings run locally; Chroma for memory; no external APIs |
 | **Grounded output** | Facts extracted with `source_url` via structured output; citations flow into the report |
 | **Iterative** | `should_continue` loops back to search when coverage is insufficient (safety-capped) |
 | **Single process** | Sequential node pipeline; I/O (fetch) parallelized within the fetch node |
@@ -20,28 +20,21 @@
 
 ## 2. Architecture Overview (implemented)
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                  MONOLITHIC RESEARCH GRAPH                     │
-│                                                                │
-│   ┌──────┐   ┌────────┐   ┌────────┐   ┌─────────┐            │
-│   │ plan │──▶│ search │──▶│ fetch  │──▶│ analyze │            │
-│   └──────┘   └────────┘   └────────┘   └─────────┘            │
-│                                            │                  │
-│                                     ┌──────▼─────────┐        │
-│                                     │ should_continue │        │
-│                                     └──┬─────────┬───┘        │
-│                                  "search"│       │"synthesize" │
-│                                        ▼       ▼             │
-│                                (loop back)  ┌────────┐        │
-│                                            │ memory │        │
-│                                            └───┬────┘        │
-│                                                ▼             │
-│                                            │synthesize│      │
-│                                            └───┬────┘        │
-│                                                ▼             │
-│                                               END            │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    query([User query]) --> plan[plan]
+    plan --> search[search]
+    search --> fetch[fetch]
+    fetch --> analyze[analyze]
+    analyze --> should{should_continue}
+    should -->|"search (loop back)"| search
+    should -->|"synthesize"| memory[memory]
+    memory --> synthesize[synthesize]
+    synthesize --> end([END])
+
+    subgraph loop[Iteration loop]
+        search --> fetch --> analyze --> should
+    end
 ```
 
 The graph is a single `StateGraph(ResearchState)` compiled in `graph.py`. All nodes are synchronous and run in order; `fetch_node` parallelizes its own I/O internally with `asyncio`.
@@ -79,17 +72,21 @@ Unlike the original sub-agent design, there are **no** `Annotated[..., operator.
 
 ## 4. Component Design
 
-### 4.1 LLM: Ollama ChatOllama
+### 4.1 LLM: OpenAI-compatible server (mlx_lm.server)
 
 | Property | Value |
 |---|---|
-| Client | `langchain_ollama.ChatOllama` |
-| Model | `.env`: `qwen3.5:4b`; `config.py` default: `qwen3:8b-q4_K_M` |
-| Context window | 262144 (256K) recommended via `num_ctx` |
-| Embeddings | `.env`: `nomic-embed-text`; `config.py` default: `mxbai-embed-large` |
+| Client | `langchain_openai.ChatOpenAI` (OpenAI-compatible) |
+| Server | `mlx_lm.server` serving a local HF model (no Ollama) |
+| Model | `.env`: `prism-ml/Ternary-Bonsai-27B-mlx-2bit` |
+| Base URL | `.env`: `LLM_BASE_URL` (default `http://localhost:8080/v1`) |
+| Context window | `LLM_NUM_CTX` (default 262144); native 262K from model `config.json` |
+| Embeddings | Local in-process `langchain_huggingface.HuggingFaceEmbeddings` (`.env`: `EMBED_MODEL`, default `sentence-transformers/all-MiniLM-L6-v2`) |
 | Structured output | `with_structured_output()` used in `analyze_node` |
 
-`create_llm()` in `tools.py` sets `num_thread=4`. For analysis, `analyze_node` binds a lower temperature (`ANALYSIS_TEMPERATURE`, default 0.1) before invoking.
+`create_llm()` in `tools.py` instantiates `ChatOpenAI` against `LLM_BASE_URL` with `max_retries=2`. For analysis, `analyze_node` binds a lower temperature (`ANALYSIS_TEMPERATURE`, default 0.1) before invoking.
+
+> **Model note:** the chosen LLM is a 2-bit ternary MLX model optimized for Apple Silicon unified memory. It is a *chat* model only — it has no embedding endpoint — so embeddings run in-process via `HuggingFaceEmbeddings` rather than through the server.
 
 ### 4.2 Search: DuckDuckGo (`ddgs`)
 
@@ -173,38 +170,36 @@ User query
 
 ---
 
-## 7. Ollama Integration
+## 7. LLM Server Integration (mlx_lm.server)
 
 ### Setup
 
 ```bash
 pip install -r requirements.txt
-ollama serve
-ollama pull qwen3.5:4b
-ollama pull nomic-embed-text
+mlx_lm.server \
+  --model "prism-ml/Ternary-Bonsai-27B-mlx-2bit" \
+  --port 8080 \
+  --chat-template-args '{"enable_thinking":false}'
 ```
 
-### Model Config (256K context)
+The server speaks the OpenAI `/v1` protocol at `http://localhost:8080/v1`. `config.py` points `ChatOpenAI` at `LLM_BASE_URL`. Embeddings run in-process (no server) via `langchain_huggingface.HuggingFaceEmbeddings`.
 
-```dockerfile
-# Modelfile.qwen3.5-4b-256k
-FROM qwen3.5:4b
-PARAMETER num_ctx 262144
-PARAMETER temperature 0.25
-PARAMETER num_thread 4
-```
+> **Thinking is disabled.** This is a reasoning model, but LangChain's `ChatOpenAI` does not surface the MLX `reasoning` field — when thinking is on, the response comes back with empty `content` and the reasoning is dropped, so structured fact extraction gets nothing. Launching with `--chat-template-args '{"enable_thinking":false}'` makes the model answer directly (fast, `content` always populated). This flag is only honored at server launch, not per-request.
 
-`ollama create qwen3.5-4b-256k -f Modelfile.qwen3.5-4b-256k`
+> **Context window:** the 262K context is native to this model (read from its `config.json`), so there is no `--max-context` flag — `mlx_lm.server` uses the model's own context length. `LLM_NUM_CTX` in `config.py` is documentation only and is not sent to the server.
 
-### Memory Budget (Mac Unified Memory, indicative)
+> **Requires `mlx-lm >= 0.31`** (the `qwen3_5` architecture in this model is unsupported by older releases; upgrade with `pip install --upgrade mlx-lm`).
 
-| Component | Estimate |
-|---|---|
-| LLM weights (4B, Q4_K_M) | ~3.5GB |
-| KV cache (256K context, fp16) | ~2.5GB |
-| Embeddings | ~0.5GB |
-| System + overhead | ~2GB |
-| **Total** | **~8.5GB** |
+### Memory Budget (Mac Unified Memory, 4-bit KV cache)
+
+| Component | 64K ctx | 256K ctx |
+|---|---|---|
+| LLM weights (27B ternary 2-bit, MLX) | 7.57GB | 7.57GB |
+| KV cache (4-bit, 16 full-attn layers) | 1.07GB | 4.30GB |
+| Linear-attention state (48 layers, fixed) | 0.08GB | 0.08GB |
+| Embeddings (in-process, MiniLM) | 0.24GB | 0.24GB |
+| Runtime overhead | 1.30GB | 1.30GB |
+| **Total** | **~10.3GB** | **~13.5GB** |
 
 ### CLI Flags
 
@@ -222,11 +217,16 @@ All values read from env vars with sensible defaults. Key settings:
 
 ```bash
 # Models
-LLM_MODEL=qwen3.5:4b            # or qwen3:8b-q4_K_M
-EMBED_MODEL=nomic-embed-text    # or mxbai-embed-large
+LLM_MODEL=prism-ml/Ternary-Bonsai-27B-mlx-2bit
+LLM_BASE_URL=http://localhost:8080/v1
+LLM_API_KEY=not-needed
 LLM_TEMPERATURE=0.25
 LLM_MAX_TOKENS=2048
 LLM_NUM_CTX=262144
+
+# Embeddings (local in-process)
+EMBED_BACKEND=huggingface
+EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
 
 # Search
 SEARCH_RESULTS_PER_QUERY=8
@@ -290,8 +290,8 @@ lite-deep-research-agent/
 │   └── cli.py              # Interactive REPL, saves report to reports/
 │
 └── scripts/
-    ├── setup.sh            # pip install + ollama pull
-    └── serve.sh            # Launch Ollama
+    ├── setup.sh            # pip install + mlx_lm setup
+    └── serve.sh            # Launch mlx_lm.server
 ```
 
 > Note: there is **no** `llm.py` / `search.py` / `fetch.py` / `sub_agent.py` — those were from the earlier sub-agent design. The current code consolidates everything into `tools.py` + `nodes.py`.
@@ -412,3 +412,44 @@ This section expands on the not-yet-implemented improvements ("remaining improve
 - **Where:** new `sub_agent.py` subgraph + `graph.py` composition (not started in code).
 - **Why:** The original design goal — decompose into sub-topics and research them concurrently for breadth and speed.
 - **What:** Introduce `SubTask`, `sub_search/sub_fetch/sub_analyze/sub_memory` nodes, `operator.add` reducers, and a `research_round` subgraph fanning out via `Send`. This is the largest change and is intentionally deferred; all items above are achievable on the current monolithic pipeline first.
+
+### 13.15 JSONL traffic log (from `minion`)
+- **Where:** new `logs/research.log` writer + `agent.py` research loop.
+- **Why:** `agent.py` only prints per-node wall-clock timing; runs are not replayable/debuggable. `minion.py:1204-1214,3038` writes an append-only JSONL of every request/response chunk.
+- **What:** Add a JSONL writer that records each node's input/output summary, LLM calls, and errors, so runs can be replayed/inspected offline. Low effort, high debug value.
+
+### 13.16 Recovery from stalled / degenerate model output (from `minion`)
+- **Where:** `analyze_node` (empty `extracted_facts`) and `synthesize_node` (empty report).
+- **Why:** The 2-bit ternary LLM can emit only reasoning tokens, repetition loops, or empty output. `minion.py:3273-3360,3498-3620` cuts the stream and appends a "[Runtime note: ...]" nudge.
+- **What:** Detect empty/low-yield LLM output per node and retry once with a nudge prompt (e.g. "Output only the structured facts") instead of silently proceeding to synthesis.
+
+### 13.17 Retry-with-backoff + connection-failure resilience (from `minion`)
+- **Where:** network + LLM call sites in `tools.py` / `nodes.py`.
+- **Why:** LDR's search/fetch/LLM calls have no retry layer; a transient error just logs and continues thin. `minion.py:2447-2470,2839-2870` retries connection errors with backoff.
+- **What:** Add a small bounded-retry wrapper `with_retry(fn, max_attempts, backoff)` around DDG, the OpenAI-compatible LLM, and Chroma calls.
+
+### 13.18 Fact dedup/cap helper (from `minion`)
+- **Where:** after `analyze_node`, before `synthesize_node` (overlaps with §13.3).
+- **Why:** `analyze_node` truncates per page but never dedupes facts across pages. `minion.py:2680-2718` dedupes identical consecutive lines (runs ≥3) and caps result size to bound context.
+- **What:** Port the dedup/cap helper and apply it to `extracted_facts` before synthesis. Same mechanism as §13.3 cross-source dedup, presented under a shared helper.
+
+### 13.19 Normalized token/time telemetry footer (from `minion`)
+- **Where:** end of `research()` in `agent.py`.
+- **Why:** Current observability (§10) is basic wall-clock only. `minion.py:1940-1999,3622-3661` normalizes token usage and prints a compact footer (tokens, tok/s, TTFT, ctx util).
+- **What:** Record per-node token + latency cost into a normalized summary struct and print it at the end of `research()`.
+
+### 13.20 Backend-agnostic usage normalization layer (from `minion`)
+- **Where:** `tools.py` as a thin `normalize_usage(...)`.
+- **Why:** `minion.py:1940-1999` never assumes one usage format. Although the server is fixed now, a second backend (roadmap) would reuse this.
+- **What:** Build `normalize_usage(...)` now so a future LLM backend swap is trivial.
+
+### 13.21 Compact-counter abbreviation helpers (from `minion`)
+- **Where:** `util._abbr(n)` helper used in the CLI footer.
+- **Why:** Trivial but useful for a tidy footer. `minion.py:2093-2122` renders counts/char totals compactly (facts=1.5K, chars=78K).
+- **What:** Port `util._abbr(n)` and use it in the §13.19 telemetry footer.
+
+### 13.22 Auto context-compression (from `minion`, partial)
+- **Where:** right before `synthesize_node`.
+- **Why:** LDR has no compression; `extracted_facts` just grow. `minion.py:2880-3035` folds old history when context is full.
+- **What:** Lighter version — when `extracted_facts` exceeds `FACT_COMPRESS_THRESHOLD`, summarize/compress them so the synthesis context stays bounded (medium value given the fixed 256K ctx).
+

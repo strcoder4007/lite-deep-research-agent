@@ -2,8 +2,10 @@ langgraph
 langchain
 langchain-text-splitters
 langchain-chroma
-langchain-ollama
+langchain-openai
+langchain-huggingface
 chromadb
+sentence-transformers
 numpy
 ddgs
 aiohttp
