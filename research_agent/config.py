@@ -6,6 +6,10 @@ from pathlib import Path
 LLM_MODEL = os.getenv("LLM_MODEL", "Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8080/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "not-needed")
+# Native context length (262K) comes from the model's config.json;
+# mlx_lm.server has no --max-context flag. This constant is used for
+# context-usage tracking in the agent loop.
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "262144"))
 
 # Embeddings: in-process HuggingFace sentence-transformers (no external server needed).
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
