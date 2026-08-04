@@ -12,6 +12,7 @@ ONE tool call per turn. Any other reply is treated as the final answer.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -20,6 +21,9 @@ from langchain_core.messages import BaseMessage
 from . import logutil
 from .tools import _extract_json_object
 _PROMPT_TEMPLATE = """You are a general-purpose local agent. Answer the user's request.
+
+Current date: {current_date}
+Day of week: {day_of_week}
 
 You have these tools:
 {catalog}
@@ -38,7 +42,12 @@ Rules:
 
 
 def build_system_prompt(catalog: str) -> str:
-    return _PROMPT_TEMPLATE.format(catalog=catalog)
+    now = datetime.now()
+    return _PROMPT_TEMPLATE.format(
+        current_date=now.strftime("%Y-%m-%d"),
+        day_of_week=now.strftime("%A"),
+        catalog=catalog,
+    )
 
 
 def chat(
