@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from langsmith import traceable
 try:  # prefer new package name
@@ -36,6 +37,20 @@ import trafilatura
 from .. import config
 
 
+_ddg_session: Optional[DDGS] = None
+_ddg_session_lock = threading.Lock()
+
+
+def _get_ddg_session() -> DDGS:
+    """Return a thread-local DDGS session, creating one if needed."""
+    global _ddg_session
+    if _ddg_session is None:
+        with _ddg_session_lock:
+            if _ddg_session is None:
+                _ddg_session = DDGS()
+    return _ddg_session
+
+
 @dataclass
 class ResearchTools:
     llm: BaseChatModel
@@ -62,6 +77,49 @@ def create_llm(
 
 def create_embedder(model: str = config.EMBED_MODEL) -> Embeddings:
     return HuggingFaceEmbeddings(model_name=model)
+
+
+class CachingEmbeddings(Embeddings):
+    """Wrap an embedder and cache embedding results to avoid recomputation."""
+
+    def __init__(self, embedder: Embeddings, max_size: int = config.EMBED_CACHE_MAX) -> None:
+        self._embedder = embedder
+        self._max_size = max_size
+        self._cache: Dict[str, List[float]] = {}
+
+    def _key(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        uncached: List[str] = []
+        indices: List[int] = []
+        results: List[Optional[List[float]]] = [None] * len(texts)
+        for i, text in enumerate(texts):
+            key = self._key(text)
+            if key in self._cache:
+                results[i] = self._cache[key]
+            else:
+                uncached.append(text)
+                indices.append(i)
+        if uncached:
+            cached_results = self._embedder.embed_documents(uncached)
+            for idx, emb in zip(indices, cached_results):
+                k = self._key(texts[idx])
+                self._cache[k] = emb
+                if len(self._cache) > self._max_size:
+                    self._cache.pop(next(iter(self._cache)))
+                results[idx] = emb
+        return cast(List[List[float]], results)
+
+    def embed_query(self, text: str) -> List[float]:
+        key = self._key(text)
+        if key in self._cache:
+            return self._cache[key]
+        result = self._embedder.embed_query(text)
+        self._cache[key] = result
+        if len(self._cache) > self._max_size:
+            self._cache.pop(next(iter(self._cache)))
+        return result
 
 
 def create_vectorstore(embedder: Embeddings) -> Chroma:
@@ -109,7 +167,7 @@ def count_tokens(embedder: Embeddings, text: str) -> int:
 
 
 def build_tools() -> ResearchTools:
-    embedder = create_embedder()
+    embedder = CachingEmbeddings(create_embedder())
     tools = ResearchTools(
         llm=create_llm(),
         embedder=embedder,
@@ -163,18 +221,18 @@ def run_ddg_search(
     time_limit: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     search_query = _inject_date_filters(query, since_days=since_days, date_from=date_from, date_to=date_to)
-    with DDGS() as search:
-        if time_limit:
-            results = list(
-                search.news(
-                    safesearch="off",
-                    keywords=search_query,
-                    timelimit=time_limit,
-                    max_results=max_results,
-                )
+    search = _get_ddg_session()
+    if time_limit:
+        results = list(
+            search.news(
+                safesearch="off",
+                keywords=search_query,
+                timelimit=time_limit,
+                max_results=max_results,
             )
-        else:
-            results = list(search.text(search_query, max_results=max_results))
+        )
+    else:
+        results = list(search.text(search_query, max_results=max_results))
     cleaned = []
     for item in results:
         url = item.get("href") or item.get("url")

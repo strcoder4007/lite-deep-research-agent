@@ -13,6 +13,7 @@ LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "262144"))
 
 # Embeddings: in-process HuggingFace sentence-transformers (no external server needed).
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_CACHE_MAX = int(os.getenv("EMBED_CACHE_MAX", "5000"))
 
 # Execution/limits
 # The server splits reasoning traces into a separate `reasoning` field, so
@@ -24,6 +25,7 @@ LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "180"))
 
 # Search/fetch settings
 SEARCH_RESULTS_PER_QUERY = int(os.getenv("SEARCH_RESULTS_PER_QUERY", "8"))
+FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "4"))
 
 # Memory/vector store
 MEMORY_DIR = Path(os.getenv("MEMORY_DIR", "advanced_memory"))
