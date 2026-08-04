@@ -39,7 +39,7 @@ You have these tools:
 
 To use a tool, reply with ONLY a JSON block, nothing else:
 ```json
-{{"tool": "<name>", "args": {"<arg>": <value>}}}
+{{"tool": "<name>", "args": {{"<arg>": <value>}}}}
 ```
 
 You can call multiple tools in a single turn by returning a JSON array:
