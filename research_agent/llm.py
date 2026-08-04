@@ -86,6 +86,10 @@ def chat(
         + (f" ({total_tokens} tok)" if total_tokens else "")
     )
 
+    reasoning = response.additional_kwargs.get("reasoning", "")
+    if reasoning:
+        logutil._print(logutil.dim(f"  [reasoning]\n{reasoning}"))
+
     parsed = _extract_json_object(text)
     if isinstance(parsed, dict) and isinstance(parsed.get("tool"), str):
         args = parsed.get("args")
