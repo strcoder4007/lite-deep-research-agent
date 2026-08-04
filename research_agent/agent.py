@@ -54,7 +54,7 @@ def run(
     log_path = log_dir / f"run_{digest}.log"
     logutil.set_log_file(str(log_path))
 
-    logutil._print(logutil.bold(f"Query: {query}"))
+    logutil._print(logutil.header(f"Query: {query}"))
 
     messages: List[Any] = [
         SystemMessage(content=llm.build_system_prompt(build_catalog())),
@@ -108,7 +108,6 @@ def run(
             try:
                 result = entry["fn"](**args)
             except TypeError as exc:
-                # Bad args from the model: feed the error back as the result.
                 result = {"error": f"bad arguments: {exc}"}
                 errors.append(f"step {step}: {name} bad args: {exc}")
             except Exception as exc:
@@ -123,6 +122,7 @@ def run(
                 logutil.tool_step(step, name, preview)
                 + logutil.dim(f"  {elapsed:.1f}s")
             )
+            logutil._print(logutil.tool_result(result))
 
         messages.append(AIMessage(content=text))
         messages.append(
@@ -144,8 +144,7 @@ def run(
         answer = str(steps[-1].get("answer") or steps[-1].get("result") or "")
 
     context_used = total_prompt_tokens
-    logutil._print(
-        logutil.run_summary(
+    logutil._print(logutil.run_summary(
             total_steps=len(steps),
             total_time=total_time,
             total_tokens=total_tokens,
@@ -155,7 +154,8 @@ def run(
             errors=errors,
         )
     )
-    logutil._print(logutil.bold(f"Answer: {answer}"))
+    logutil._print(logutil.agent(f"Answer: {answer}"))
+    logutil._print(logutil.separator())
     logutil.close_log()
 
     if history is not None:

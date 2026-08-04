@@ -24,7 +24,7 @@ def close_log() -> None:
 def _print(msg: str) -> None:
     print(msg)
     if _log_file is not None:
-        _log_file.write(msg + "\n")
+        _log_file.write(strip_ansi(msg) + "\n")
         _log_file.flush()
 
 
@@ -47,10 +47,8 @@ class C:
     WHITE = "\033[37m"
 
 
-def _c(code: str, text: str) -> str:
-    if not _USE_COLOR:
-        return text
-    return f"{code}{text}{C.RESET}"
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", text)
 
 
 def bold(text: str) -> str:
@@ -83,6 +81,43 @@ def magenta(text: str) -> str:
 
 def cyan(text: str) -> str:
     return _c(C.CYAN, text)
+
+
+def user(text: str) -> str:
+    return green(bold(f" you: {text}"))
+
+
+def agent(text: str) -> str:
+    return cyan(bold(f" agent: {text}"))
+
+
+def success(text: str) -> str:
+    return green(f" ✓ {text}")
+
+
+def error(text: str) -> str:
+    return red(bold(f" ✗ {text}"))
+
+
+def header(text: str) -> str:
+    return magenta(bold(text))
+
+
+def separator() -> str:
+    return dim("─" * 50)
+
+
+def tool_result(result: Any) -> str:
+    if isinstance(result, dict) and "error" in result:
+        return red(f"  error: {result['error']}")
+    if isinstance(result, dict):
+        keys = ", ".join(result.keys())
+        return green(f"  ok ({keys})")
+    return green(f"  ok: {truncate(str(result), 120)}")
+
+
+def thinking() -> str:
+    return cyan("  thinking…")
 
 
 def abbr(n: int) -> str:
@@ -162,7 +197,7 @@ def preview_for_node(node: str, payload: dict) -> str:
 
 def tool_step(step: int, tool_name: str, preview: str, limit: int = 200) -> str:
     """Colored per-step line for the agent loop: step N | tool=<name> | preview."""
-    header = node_label(f"step {step}") + " " + blue(f"tool={tool_name}")
+    header = node_label(f"step {step}") + " " + yellow(f"tool={tool_name}")
     if preview:
         header += dim(" | " + truncate(preview, limit))
     return header
@@ -185,7 +220,7 @@ def run_summary(
     """Return a colored end-of-run summary block."""
     lines = [
         "",
-        bold("═══ Run Summary ═══"),
+        header("═══ Run Summary ═══"),
         f"  Steps:           {total_steps}",
         f"  Total time:      {total_time:.1f}s",
     ]
@@ -201,10 +236,10 @@ def run_summary(
     if errors:
         lines.append(f"  Errors:          {len(errors)}")
         for err in errors:
-            lines.append(f"    - {err}")
+            lines.append(f"    {error(err)}")
     else:
-        lines.append("  Errors:          none")
-    lines.append("═══")
+        lines.append(f"  Errors:          {success('none')}")
+    lines.append(header("═══"))
     return "\n".join(lines)
 
 
