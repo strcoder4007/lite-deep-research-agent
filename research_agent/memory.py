@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
 
 from . import config
 from .tools import ResearchTools
@@ -23,6 +24,32 @@ class Scratchpad:
 
     def render(self) -> str:
         return "\n".join(f"- {note}" for note in self._notes)
+
+
+class ConversationMemory:
+    """Simple in-memory store of previous query/answer turns."""
+
+    def __init__(self, max_turns: int = 10) -> None:
+        self._turns: List[Tuple[str, str]] = []
+        self._max_turns = max_turns
+
+    def add(self, query: str, answer: str) -> None:
+        self._turns.append((query, answer))
+        if len(self._turns) > self._max_turns:
+            self._turns.pop(0)
+
+    def messages(self) -> List[Any]:
+        msgs: List[Any] = []
+        for q, a in self._turns:
+            msgs.append(HumanMessage(content=q))
+            msgs.append(AIMessage(content=a))
+        return msgs
+
+    def clear(self) -> None:
+        self._turns.clear()
+
+    def __len__(self) -> int:
+        return len(self._turns)
 
 
 def add_to_memory(

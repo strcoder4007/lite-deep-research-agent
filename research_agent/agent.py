@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from . import config, llm, logutil
+from .memory import ConversationMemory
 from .tools import (
     TOOL_REGISTRY,
     ResearchTools,
@@ -37,8 +38,13 @@ def run(
     tools: Optional[ResearchTools] = None,
     max_steps: int = config.MAX_AGENT_STEPS,
     verbose: bool = True,
+    history: Optional[ConversationMemory] = None,
 ) -> Dict[str, Any]:
-    """Run the agent loop on ``query`` and return a result dict."""
+    """Run the agent loop on ``query`` and return a result dict.
+
+    ``history`` is an optional ``ConversationMemory`` whose previous
+    turns are prepended to the message list so the model sees context.
+    """
     tools = tools or build_tools()
     init_tools(tools)
 
@@ -48,10 +54,15 @@ def run(
     log_path = log_dir / f"run_{digest}.log"
     logutil.set_log_file(str(log_path))
 
-    messages = [
+    logutil._print(logutil.bold(f"Query: {query}"))
+
+    messages: List[Any] = [
         SystemMessage(content=llm.build_system_prompt(build_catalog())),
-        HumanMessage(content=query.strip()),
     ]
+    if history is not None:
+        messages.extend(history.messages())
+    messages.append(HumanMessage(content=query.strip()))
+
     steps: List[Dict[str, Any]] = []
     errors: List[str] = []
     answer = ""
@@ -144,7 +155,11 @@ def run(
             errors=errors,
         )
     )
+    logutil._print(logutil.bold(f"Answer: {answer}"))
     logutil.close_log()
+
+    if history is not None:
+        history.add(query, answer)
 
     return {"query": query, "answer": answer, "steps": steps, "errors": errors}
 

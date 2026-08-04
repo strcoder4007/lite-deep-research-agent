@@ -12,6 +12,7 @@ except Exception:
     pass
 
 from .agent import run
+from .memory import ConversationMemory
 
 
 EXAMPLE_QUERIES = [
@@ -35,29 +36,33 @@ def _choose_query() -> str:
 
 
 def main() -> int:
-    try:
-        query = _choose_query()
-        if not query:
-            print("No query provided. Exiting.")
-            return 1
-        result = run(query=query, verbose=True)
-    except KeyboardInterrupt:
-        print("\nAborted.")
-        return 1
-    report = result.get("answer", "")
-    print("\n=== Final Answer ===\n")
-    print(report)
-    if result.get("errors"):
-        print("\n=== Errors ===")
-        for err in result["errors"]:
-            print(f"- {err}")
-    digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
-    reports_dir = Path("reports")
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    path = reports_dir / f"report_{digest}.txt"
-    path.write_text(report)
-    print(f"\nSaved report to {path}")
-    return 0
+    history = ConversationMemory()
+    print("Lite Deep Research Agent — type 'quit' to exit")
+    print("─" * 40)
+    while True:
+        try:
+            query = _choose_query()
+        except (KeyboardInterrupt, EOFError):
+            print("\nGoodbye.")
+            return 0
+        if not query or query.lower() in ("quit", "exit", "q"):
+            print("Goodbye.")
+            return 0
+        result = run(query=query, verbose=True, history=history)
+        report = result.get("answer", "")
+        print("\n=== Final Answer ===\n")
+        print(report)
+        if result.get("errors"):
+            print("\n=== Errors ===")
+            for err in result["errors"]:
+                print(f"- {err}")
+        digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
+        reports_dir = Path("reports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        path = reports_dir / f"report_{digest}.txt"
+        path.write_text(report)
+        print(f"\nSaved report to {path}")
+        print("─" * 40)
 
 
 if __name__ == "__main__":
