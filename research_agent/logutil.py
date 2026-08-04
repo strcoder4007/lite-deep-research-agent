@@ -2,9 +2,36 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, List
+from datetime import datetime
+from typing import Any, List, Optional, TextIO
 
 _USE_COLOR = os.getenv("NO_COLOR") is None and os.getenv("TERM", "") != "dumb"
+_log_file: Optional[TextIO] = None
+
+
+def set_log_file(path: str) -> None:
+    global _log_file
+    _log_file = open(path, "a", encoding="utf-8")
+
+
+def close_log() -> None:
+    global _log_file
+    if _log_file is not None:
+        _log_file.close()
+        _log_file = None
+
+
+def _print(msg: str) -> None:
+    print(msg)
+    if _log_file is not None:
+        _log_file.write(msg + "\n")
+        _log_file.flush()
+
+
+def _c(code: str, text: str) -> str:
+    if not _USE_COLOR:
+        return text
+    return f"{code}{text}{C.RESET}"
 
 
 class C:

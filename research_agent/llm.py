@@ -59,7 +59,7 @@ def chat(
       - toolcall is {"tool": name, "args": {...}} or None
       - info is {"elapsed": float, "tokens": int, "prompt_tokens": int}
     """
-    print(logutil.stage("llm") + " calling model ...")
+    logutil._print(logutil.stage("llm") + " calling model ...")
     started = time.perf_counter()
     response = llm.invoke(messages)
     elapsed = time.perf_counter() - started
@@ -80,7 +80,7 @@ def chat(
     prompt_tokens = token_usage.get("prompt_tokens", 0)
     info = {"elapsed": elapsed, "tokens": total_tokens, "prompt_tokens": prompt_tokens}
 
-    print(
+    logutil._print(
         logutil.stage("llm")
         + f" done in {elapsed:.2f}s"
         + (f" ({total_tokens} tok)" if total_tokens else "")

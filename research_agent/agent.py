@@ -5,8 +5,10 @@ call (```json {"tool": name, "args": {...}} ```) or a plain-text final answer.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -39,6 +41,12 @@ def run(
     """Run the agent loop on ``query`` and return a result dict."""
     tools = tools or build_tools()
     init_tools(tools)
+
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
+    log_path = log_dir / f"run_{digest}.log"
+    logutil.set_log_file(str(log_path))
 
     messages = [
         SystemMessage(content=llm.build_system_prompt(build_catalog())),
@@ -75,12 +83,12 @@ def run(
             answer = text
             steps.append({"step": step, "tool": None, "answer": text})
             if verbose:
-                print(logutil.tool_step(step, "final(text)", text))
+                logutil._print(logutil.tool_step(step, "final(text)", text))
             break
 
         name = call["tool"]
         args = call["args"]
-        print(logutil.stage("tool") + f" {name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
+        logutil._print(logutil.stage("tool") + f" {name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
         entry = get_tool(name)
         if entry is None:
             result: Any = {"error": f"unknown tool: {name}"}
@@ -100,7 +108,7 @@ def run(
         if verbose:
             elapsed = time.perf_counter() - started
             preview = _preview(result)
-            print(
+            logutil._print(
                 logutil.tool_step(step, name, preview)
                 + logutil.dim(f"  {elapsed:.1f}s")
             )
@@ -125,7 +133,7 @@ def run(
         answer = str(steps[-1].get("answer") or steps[-1].get("result") or "")
 
     context_used = total_prompt_tokens
-    print(
+    logutil._print(
         logutil.run_summary(
             total_steps=len(steps),
             total_time=total_time,
@@ -136,6 +144,7 @@ def run(
             errors=errors,
         )
     )
+    logutil.close_log()
 
     return {"query": query, "answer": answer, "steps": steps, "errors": errors}
 
