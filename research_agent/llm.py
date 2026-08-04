@@ -1,7 +1,7 @@
 """Chat helper for the agent loop: system prompt + tool-call parsing.
 
-Tool-call format, kept robust for a weak 2-bit local model: to use a tool the
-model replies with ONLY a JSON block:
+Tool-call format, kept robust for a weak 2-bit local model: to use a tool
+the model replies with ONLY a JSON block:
 
     ```json
     {"tool": "<name>", "args": {"<arg>": <value>}}
@@ -11,13 +11,14 @@ ONE tool call per turn. Any other reply is treated as the final answer.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
+from . import logutil
 from .tools import _extract_json_object
-
 _PROMPT_TEMPLATE = """You are a general-purpose local agent. Answer the user's request.
 
 You have these tools:
@@ -42,21 +43,42 @@ def build_system_prompt(catalog: str) -> str:
 
 def chat(
     messages: List[BaseMessage], llm: BaseChatModel
-) -> Tuple[str, Optional[Dict[str, Any]]]:
+) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
     """Send messages to the LLM.
 
-    Returns (text, toolcall) where toolcall is {"tool": name, "args": {...}}
-    or None when the reply was plain text (treated as a final answer).
+    Returns (text, toolcall, info) where:
+      - toolcall is {"tool": name, "args": {...}} or None
+      - info is {"elapsed": float, "tokens": int, "prompt_tokens": int}
     """
+    print(logutil.stage("llm") + " calling model ...")
+    started = time.perf_counter()
     response = llm.invoke(messages)
+    elapsed = time.perf_counter() - started
+
     content = getattr(response, "content", response)
     if isinstance(content, list):
         content = " ".join(
             c.get("text", "") if isinstance(c, dict) else str(c) for c in content
         )
     text = str(content).strip()
+
+    token_usage: Dict[str, Any] = (
+        response.response_metadata.get("token_usage", {})
+        if hasattr(response, "response_metadata")
+        else {}
+    )
+    total_tokens = token_usage.get("total_tokens", 0)
+    prompt_tokens = token_usage.get("prompt_tokens", 0)
+    info = {"elapsed": elapsed, "tokens": total_tokens, "prompt_tokens": prompt_tokens}
+
+    print(
+        logutil.stage("llm")
+        + f" done in {elapsed:.2f}s"
+        + (f" ({total_tokens} tok)" if total_tokens else "")
+    )
+
     parsed = _extract_json_object(text)
     if isinstance(parsed, dict) and isinstance(parsed.get("tool"), str):
         args = parsed.get("args")
-        return text, {"tool": parsed["tool"], "args": args if isinstance(args, dict) else {}}
-    return text, None
+        return text, {"tool": parsed["tool"], "args": args if isinstance(args, dict) else {}}, info
+    return text, None, info

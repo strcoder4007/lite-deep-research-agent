@@ -47,15 +47,25 @@ def run(
     steps: List[Dict[str, Any]] = []
     errors: List[str] = []
     answer = ""
+    total_tokens = 0
+    total_prompt_tokens = 0
+    total_time = 0.0
+    context_total = config.LLM_NUM_CTX
 
     for step in range(1, max_steps + 1):
         started = time.perf_counter()
-        text, call = llm.chat(messages, tools.llm)
+        text, call, info = llm.chat(messages, tools.llm)
+        total_time += info["elapsed"]
+        total_tokens += info["tokens"]
+        total_prompt_tokens += info["prompt_tokens"]
 
         # Nudge retry once on empty/degenerate output (HLD §13.16 pattern).
         if not text.strip():
             messages.append(HumanMessage(content=config.AGENT_NUDGE))
-            text, call = llm.chat(messages, tools.llm)
+            text, call, nudge_info = llm.chat(messages, tools.llm)
+            total_time += nudge_info["elapsed"]
+            total_tokens += nudge_info["tokens"]
+            total_prompt_tokens += nudge_info["prompt_tokens"]
             if not text.strip():
                 errors.append(f"step {step}: empty model output after nudge")
                 break
@@ -70,6 +80,7 @@ def run(
 
         name = call["tool"]
         args = call["args"]
+        print(logutil.stage("tool") + f" {name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
         entry = get_tool(name)
         if entry is None:
             result: Any = {"error": f"unknown tool: {name}"}
@@ -88,8 +99,9 @@ def run(
         steps.append({"step": step, "tool": name, "args": args, "result": result})
         if verbose:
             elapsed = time.perf_counter() - started
+            preview = _preview(result)
             print(
-                logutil.tool_step(step, name, _preview(result))
+                logutil.tool_step(step, name, preview)
                 + logutil.dim(f"  {elapsed:.1f}s")
             )
 
@@ -111,6 +123,19 @@ def run(
     if not answer and steps:
         # Fall back to the last model text if the loop never finalized.
         answer = str(steps[-1].get("answer") or steps[-1].get("result") or "")
+
+    context_used = total_prompt_tokens
+    print(
+        logutil.run_summary(
+            total_steps=len(steps),
+            total_time=total_time,
+            total_tokens=total_tokens,
+            prompt_tokens=total_prompt_tokens,
+            context_used=context_used,
+            context_total=context_total,
+            errors=errors,
+        )
+    )
 
     return {"query": query, "answer": answer, "steps": steps, "errors": errors}
 

@@ -141,6 +141,46 @@ def tool_step(step: int, tool_name: str, preview: str, limit: int = 200) -> str:
     return header
 
 
+def stage(label: str) -> str:
+    """Return a colored stage indicator."""
+    return cyan(f"[{label}]")
+
+
+def run_summary(
+    total_steps: int,
+    total_time: float,
+    total_tokens: int,
+    prompt_tokens: int,
+    context_used: int,
+    context_total: int,
+    errors: List[str],
+) -> str:
+    """Return a colored end-of-run summary block."""
+    lines = [
+        "",
+        bold("═══ Run Summary ═══"),
+        f"  Steps:           {total_steps}",
+        f"  Total time:      {total_time:.1f}s",
+    ]
+    if total_tokens > 0:
+        avg = total_tokens / total_time if total_time > 0 else 0
+        lines.append(f"  Avg speed:       {avg:.1f} tok/s")
+        lines.append(f"  Tokens:          {total_tokens} total ({prompt_tokens} prompt)")
+    if context_total > 0:
+        lines.append(
+            "  Context:         "
+            + context_bar(context_used, context_total)
+        )
+    if errors:
+        lines.append(f"  Errors:          {len(errors)}")
+        for err in errors:
+            lines.append(f"    - {err}")
+    else:
+        lines.append("  Errors:          none")
+    lines.append("═══")
+    return "\n".join(lines)
+
+
 def yaml_safe_dump(data: Any) -> str:
     try:
         import yaml
