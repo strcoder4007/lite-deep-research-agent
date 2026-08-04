@@ -1,105 +1,118 @@
+"""General-purpose local agent with a custom lightweight tool-calling loop.
+
+No LangGraph: a simple step loop where the model either emits one JSON tool
+call (```json {"tool": name, "args": {...}} ```) or a plain-text final answer.
+"""
 from __future__ import annotations
 
-import hashlib
+import json
 import time
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from . import config
-from .graph import create_research_graph
-from .logutil import (
-    bold,
-    blue,
-    cyan,
-    dim,
-    green,
-    magenta,
-    node_label,
-    preview_for_node,
-    red,
-    yellow,
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from . import config, llm, logutil
+from .tools import (
+    TOOL_REGISTRY,
+    ResearchTools,
+    build_catalog,
+    build_tools,
+    get_tool,
+    init_tools,
 )
-from .state import append_message
-from .tools import ResearchTools, build_tools
+from .tools import finalize as _finalize
 
 
-class AdvancedResearchAgent:
-    def __init__(self, tools: Optional[ResearchTools] = None):
-        self.tools = tools or build_tools()
-        self.graph = create_research_graph(self.tools)
+def _preview(result: Any) -> str:
+    try:
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except Exception:
+        return str(result)
 
-    def research(
-        self, query: str, max_iterations: int = config.MAX_ITERATIONS, verbose: bool = True
-    ) -> Dict[str, Any]:
-        query = query.strip()
-        initial_state: Dict[str, Any] = {
-            "query": query,
-            "iteration": 0,
-            "max_iterations": max_iterations,
-            "messages": [],
-            "errors": [],
-            "search_queries": [],
-        }
-        run_id = hashlib.sha1(query.encode("utf-8")).hexdigest()[:8]
-        append_message(initial_state, f"Starting research for: {query}")
-        latest_state = dict(initial_state)
-        last_time = time.perf_counter()
 
-        def _log_node(name: str, payload: Dict[str, Any], elapsed: float) -> None:
-            summary_parts = []
-            if payload.get("search_results"):
-                summary_parts.append(f"results={len(payload['search_results'])}")
-            if payload.get("fetched_content"):
-                summary_parts.append(f"fetched={len(payload['fetched_content'])}")
-            if payload.get("extracted_facts"):
-                summary_parts.append(f"facts={len(payload['extracted_facts'])}")
-            if payload.get("relevant_memory"):
-                summary_parts.append(f"memory={len(payload['relevant_memory'])}")
-            if payload.get("sources"):
-                summary_parts.append(f"sources={len(payload['sources'])}")
-            if payload.get("errors"):
-                summary_parts.append(f"errors={len(payload['errors'])}")
-            summary = " | ".join(summary_parts) if summary_parts else ""
-            header = (
-                node_label(name)
-                + " "
-                + dim(f"{elapsed:7.1f}s")
-                + (blue(f"  {summary}") if summary else "")
+def run(
+    query: str,
+    tools: Optional[ResearchTools] = None,
+    max_steps: int = config.MAX_AGENT_STEPS,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Run the agent loop on ``query`` and return a result dict."""
+    tools = tools or build_tools()
+    init_tools(tools)
+
+    messages = [
+        SystemMessage(content=llm.build_system_prompt(build_catalog())),
+        HumanMessage(content=query.strip()),
+    ]
+    steps: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    answer = ""
+
+    for step in range(1, max_steps + 1):
+        started = time.perf_counter()
+        text, call = llm.chat(messages, tools.llm)
+
+        # Nudge retry once on empty/degenerate output (HLD §13.16 pattern).
+        if not text.strip():
+            messages.append(HumanMessage(content=config.AGENT_NUDGE))
+            text, call = llm.chat(messages, tools.llm)
+            if not text.strip():
+                errors.append(f"step {step}: empty model output after nudge")
+                break
+
+        if call is None:
+            # No tool call: treat the text as the final answer.
+            answer = text
+            steps.append({"step": step, "tool": None, "answer": text})
+            if verbose:
+                print(logutil.tool_step(step, "final(text)", text))
+            break
+
+        name = call["tool"]
+        args = call["args"]
+        entry = get_tool(name)
+        if entry is None:
+            result: Any = {"error": f"unknown tool: {name}"}
+            errors.append(f"step {step}: unknown tool {name}")
+        else:
+            try:
+                result = entry["fn"](**args)
+            except TypeError as exc:
+                # Bad args from the model: feed the error back as the result.
+                result = {"error": f"bad arguments: {exc}"}
+                errors.append(f"step {step}: {name} bad args: {exc}")
+            except Exception as exc:
+                result = {"error": f"{type(exc).__name__}: {exc}"}
+                errors.append(f"step {step}: {name} failed: {exc}")
+
+        steps.append({"step": step, "tool": name, "args": args, "result": result})
+        if verbose:
+            elapsed = time.perf_counter() - started
+            print(
+                logutil.tool_step(step, name, _preview(result))
+                + logutil.dim(f"  {elapsed:.1f}s")
             )
-            if name in ("plan", "analyze", "synthesize"):
-                preview = preview_for_node(name, payload)
-                print(header + preview)
-            else:
-                print(header)
 
-        stream_config = {
-            "configurable": {"thread_id": run_id},
-            "metadata": {"query": query},
-        }
+        messages.append(AIMessage(content=text))
+        messages.append(
+            HumanMessage(content=f"Tool result ({name}):\n{_preview(result)}")
+        )
 
-        for event in self.graph.stream(initial_state, config=stream_config):
-            for node, data in event.items():
-                latest_state = {**latest_state, **data}
-                if verbose:
-                    now = time.perf_counter()
-                    _log_node(node, data, now - last_time)
-                    last_time = now
-        final_state = latest_state
-        return {
-            "query": query,
-            "report": final_state.get("final_answer", ""),
-            "sources": final_state.get("sources", []),
-            "plan": final_state.get("research_plan", {}),
-            "message_log": final_state.get("messages", []),
-            "errors": final_state.get("errors", []),
-        }
+        if name == "final_answer":
+            answer = str(args.get("answer", result))
+            break
+        sentinel = _finalize.take_final_answer()
+        if sentinel is not None:
+            answer = sentinel
+            break
+    else:
+        errors.append(f"stopped after {max_steps} steps without a final answer")
 
-    def visualize_graph(self, output_path: str = "graph.png") -> Optional[Path]:
-        try:
-            graph = self.graph.get_graph()
-            data = graph.draw_png()
-        except Exception:
-            return None
-        path = Path(output_path)
-        path.write_bytes(data)
-        return path
+    if not answer and steps:
+        # Fall back to the last model text if the loop never finalized.
+        answer = str(steps[-1].get("answer") or steps[-1].get("result") or "")
+
+    return {"query": query, "answer": answer, "steps": steps, "errors": errors}
+
+
+__all__ = ["run", "TOOL_REGISTRY"]

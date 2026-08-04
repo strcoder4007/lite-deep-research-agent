@@ -11,7 +11,7 @@ try:  # load environment variables from .env if present
 except Exception:
     pass
 
-from .agent import AdvancedResearchAgent
+from .agent import run
 
 
 EXAMPLE_QUERIES = [
@@ -35,22 +35,22 @@ def _choose_query() -> str:
 
 
 def main() -> int:
-    agent = AdvancedResearchAgent()
     try:
         query = _choose_query()
         if not query:
             print("No query provided. Exiting.")
             return 1
-        result = agent.research(query=query, verbose=True)
+        result = run(query=query, verbose=True)
     except KeyboardInterrupt:
         print("\nAborted.")
         return 1
-    report = result.get("report", "")
-    print("\n=== Research Report ===\n")
+    report = result.get("answer", "")
+    print("\n=== Final Answer ===\n")
     print(report)
-    print("\n=== Sources ===")
-    for src in result.get("sources", []):
-        print(f"- {src}")
+    if result.get("errors"):
+        print("\n=== Errors ===")
+        for err in result["errors"]:
+            print(f"- {err}")
     digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
     reports_dir = Path("reports")
     reports_dir.mkdir(parents=True, exist_ok=True)

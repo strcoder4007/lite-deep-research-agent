@@ -10,6 +10,21 @@ from . import config
 from .tools import ResearchTools
 
 
+class Scratchpad:
+    """Tiny in-memory working notes for the agent loop."""
+
+    def __init__(self) -> None:
+        self._notes: List[str] = []
+
+    def add(self, note: str) -> None:
+        note = (note or "").strip()
+        if note:
+            self._notes.append(note)
+
+    def render(self) -> str:
+        return "\n".join(f"- {note}" for note in self._notes)
+
+
 def add_to_memory(
     tools: ResearchTools,
     text: str,

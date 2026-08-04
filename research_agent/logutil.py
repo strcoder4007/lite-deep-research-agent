@@ -58,6 +58,32 @@ def cyan(text: str) -> str:
     return _c(C.CYAN, text)
 
 
+def abbr(n: int) -> str:
+    """Compact number abbreviation: 1500 -> 1.5K, 78000 -> 78K."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}K".rstrip("0").rstrip(".")
+    return f"{n / 1_000_000:.1f}M".rstrip("0").rstrip(".")
+
+
+def context_bar(used: int, total: int, width: int = 20) -> str:
+    """Render a colored context-usage bar (used/total)."""
+    if total <= 0:
+        pct = 0.0
+    else:
+        pct = min(used / total, 1.0)
+    filled = int(round(pct * width))
+    bar = "█" * filled + "░" * (width - filled)
+    pct_str = f"{pct * 100:.1f}%"
+    color = C.GREEN
+    if pct > 0.85:
+        color = C.RED
+    elif pct > 0.6:
+        color = C.YELLOW
+    return _c(color, bar) + dim(f" {abbr(used)}/{abbr(total)} ({pct_str})")
+
+
 def node_label(name: str) -> str:
     return _c(C.CYAN + C.BOLD, f"[{name}]")
 
@@ -105,6 +131,14 @@ def preview_for_node(node: str, payload: dict) -> str:
     if node == "synthesize":
         return model_preview("report", payload.get("final_answer") or "", 280)
     return ""
+
+
+def tool_step(step: int, tool_name: str, preview: str, limit: int = 200) -> str:
+    """Colored per-step line for the agent loop: step N | tool=<name> | preview."""
+    header = node_label(f"step {step}") + " " + blue(f"tool={tool_name}")
+    if preview:
+        header += dim(" | " + truncate(preview, limit))
+    return header
 
 
 def yaml_safe_dump(data: Any) -> str:

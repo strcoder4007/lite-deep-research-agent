@@ -1,6 +1,8 @@
 # High-Level Design — lite-deep-research-agent
 
-> **Status note:** This document originally described a parallel sub-agent (`Send` fan-out) orchestrator. The **implemented** system is a **monolithic, sequential LangGraph pipeline** (`plan → search → fetch → analyze → should_continue → memory → synthesize`). The sub-agent architecture is a *future* target (see §12 Roadmap) and is **not** in the current code. This document has been updated to describe what is actually implemented, plus the recent optimization pass.
+> **Status note (current):** The system is now a **general-purpose local agent** with a custom lightweight tool-calling loop (`agent.py: run()` + `llm.py` + a decorated tool registry in `research_agent/tools/`). **No LangGraph.** The old LangGraph research pipeline (`nodes.py` / `graph.py` / `state.py`) has been **removed** from the repo. See §14 for the agent loop design.
+>
+> **Status note (historical):** This document originally described a parallel sub-agent (`Send` fan-out) orchestrator, then a **monolithic, sequential LangGraph pipeline** (`plan → search → fetch → analyze → should_continue → memory → synthesize`). Sections 1–13 below describe that removed pipeline, kept here as design history.
 
 ## 1. System Overview
 
@@ -78,15 +80,15 @@ Unlike the original sub-agent design, there are **no** `Annotated[..., operator.
 |---|---|
 | Client | `langchain_openai.ChatOpenAI` (OpenAI-compatible) |
 | Server | `mlx_lm.server` serving a local HF model (no Ollama) |
-| Model | `.env`: `prism-ml/Ternary-Bonsai-27B-mlx-2bit` |
+| Model | `.env`: `Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit` |
 | Base URL | `.env`: `LLM_BASE_URL` (default `http://localhost:8080/v1`) |
-| Context window | `LLM_NUM_CTX` (default 262144); native 262K from model `config.json` |
+| Context window | native 262K from model `config.json` |
 | Embeddings | Local in-process `langchain_huggingface.HuggingFaceEmbeddings` (`.env`: `EMBED_MODEL`, default `sentence-transformers/all-MiniLM-L6-v2`) |
 | Structured output | `with_structured_output()` used in `analyze_node` |
 
 `create_llm()` in `tools.py` instantiates `ChatOpenAI` against `LLM_BASE_URL` with `max_retries=2`. For analysis, `analyze_node` binds a lower temperature (`ANALYSIS_TEMPERATURE`, default 0.1) before invoking.
 
-> **Model note:** the chosen LLM is a 2-bit ternary MLX model optimized for Apple Silicon unified memory. It is a *chat* model only — it has no embedding endpoint — so embeddings run in-process via `HuggingFaceEmbeddings` rather than through the server.
+> **Model note:** the chosen LLM is a 4-bit 9B MLX model (`qwen3_5` architecture) optimized for Apple Silicon unified memory. It is a *chat* model only — it has no embedding endpoint — so embeddings run in-process via `HuggingFaceEmbeddings` rather than through the server.
 
 ### 4.2 Search: DuckDuckGo (`ddgs`)
 
@@ -132,6 +134,12 @@ class AnalyzeOutput(BaseModel):
 
 Each page is analyzed with up to `ANALYSIS_SNIPPET_CHARS` (default 4000) of its text. Facts are stored as `"{claim} (source: {url})"` strings so citations survive into synthesis. A plain-text fallback runs if structured parsing fails.
 
+After extraction, `_dedupe_facts()` performs **cross-source fact deduplication**: each fact's claim (without the source suffix) is embedded, and facts with cosine similarity ≥ `FACT_DEDUP_THRESHOLD` (default 0.9) to an already-kept fact are dropped. Falls back to the raw list if embedding fails; can be disabled via `FACT_DEDUP_ENABLED=0`.
+
+### 4.6 Fetch timeout configuration (trafilatura ≥ 2.1)
+
+`trafilatura.fetch_url()` no longer accepts a `timeout` keyword (removed in trafilatura 2.1 — passing it raises `TypeError`, which previously was swallowed and made **every** fetch fail silently). The download timeout is now set via the trafilatura config object (`DEFAULT` / `DOWNLOAD_TIMEOUT`) in `fetch_url()`.
+
 ---
 
 ## 5. Graph Design (`graph.py` / `nodes.py`)
@@ -141,14 +149,14 @@ Each page is analyzed with up to `ANALYSIS_SNIPPET_CHARS` (default 4000) of its 
 | `plan` | `query` | LLM → YAML → parse into queries/aspects/gaps | `research_plan`, `search_queries`, `plan_gaps` |
 | `search` | `search_queries` | DDG search + dedup + embedding rerank | `search_results` |
 | `fetch` | `search_results` | parallel trafilatura fetch + memory write | `fetched_content` |
-| `analyze` | `fetched_content` | per-page structured fact extraction | `extracted_facts` |
-| `should_continue` | `fetched_content`, `extracted_facts`, `plan_gaps`, `iteration` | heuristic loop decision | `next_step`, `search_queries`, `iteration` |
-| `memory` | `query`, `plan_gaps` | Chroma query for context | `relevant_memory` |
+| `analyze` | `fetched_content` | per-page structured fact extraction + cross-source dedup | `extracted_facts` |
+| `should_continue` | `fetched_content`, `extracted_facts`, `research_plan`, `iteration` | LLM coverage assessment (heuristic fallback) | `next_step`, `search_queries`, `iteration` |
+| `memory` | `query`, `plan_gaps`, `fetched_content` | Chroma query for prior-run context (current-run pages excluded) | `relevant_memory` |
 | `synthesize` | `extracted_facts`, `relevant_memory` | LLM report with inline citations | `final_answer`, `sources` |
 
 ### Loop control
 
-`should_continue` returns `next_step="search"` when `iteration < max_iterations` AND (`fetched < MIN_FETCHED_FOR_STOP` OR `facts < MIN_FACTS_FOR_STOP` OR `plan_gaps`). Otherwise `next_step="synthesize"`. On continuation, new queries are appended as `f"{query} {gap}"`.
+`should_continue` first asks the LLM (`_assess_coverage`) to judge whether the extracted facts cover the user query and the plan's `KEY_ASPECTS`. The model returns `{"sufficient": bool, "missing": [...], "new_queries": [...]}`; when coverage is insufficient, the targeted `new_queries` are appended (deduped) and `next_step="search"`. The `MAX_ITERATIONS` hard cap always wins. If the assessment call fails or returns unparseable output (or `COVERAGE_ASSESSMENT_ENABLED=0`), the old heuristic applies: continue when `fetched < MIN_FETCHED_FOR_STOP` OR `facts < MIN_FACTS_FOR_STOP` OR `plan_gaps`, appending naive `f"{query} {gap}"` queries.
 
 ---
 
@@ -159,11 +167,11 @@ User query
   → plan: 4–5 search queries + aspects + gaps
   → search: DDG → dedup → embedding rerank → top-N
   → fetch: parallel trafilatura fetch (≤ FETCH_LIMIT pages) → write to Chroma
-  → analyze: per-page structured facts (claim + source_url)
-  → should_continue: enough facts?
-        no  → append gap-based queries, iteration++, loop to search
+  → analyze: per-page structured facts (claim + source_url) → cross-source dedup
+  → should_continue: LLM coverage assessment (heuristic fallback)
+        no  → append targeted follow-up queries, iteration++, loop to search
         yes → memory
-  → memory: Chroma query with original query + gaps
+  → memory: Chroma query with original query + gaps (current-run pages excluded)
   → synthesize: report from facts + memory, with inline source markers
   → END
 ```
@@ -177,29 +185,30 @@ User query
 ```bash
 pip install -r requirements.txt
 mlx_lm.server \
-  --model "prism-ml/Ternary-Bonsai-27B-mlx-2bit" \
-  --port 8080 \
-  --chat-template-args '{"enable_thinking":false}'
+  --model "Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit" \
+  --port 8080
 ```
 
 The server speaks the OpenAI `/v1` protocol at `http://localhost:8080/v1`. `config.py` points `ChatOpenAI` at `LLM_BASE_URL`. Embeddings run in-process (no server) via `langchain_huggingface.HuggingFaceEmbeddings`.
 
-> **Thinking is disabled.** This is a reasoning model, but LangChain's `ChatOpenAI` does not surface the MLX `reasoning` field — when thinking is on, the response comes back with empty `content` and the reasoning is dropped, so structured fact extraction gets nothing. Launching with `--chat-template-args '{"enable_thinking":false}'` makes the model answer directly (fast, `content` always populated). This flag is only honored at server launch, not per-request.
+> **Lazy model load.** The server binds the port immediately and loads the weights on the first request — silence after "Download complete" means *ready*, not stuck. The first generation request pays the model-load cost.
 
-> **Context window:** the 262K context is native to this model (read from its `config.json`), so there is no `--max-context` flag — `mlx_lm.server` uses the model's own context length. `LLM_NUM_CTX` in `config.py` is documentation only and is not sent to the server.
+> **No `--chat-template-args`.** Unlike the old 27B, this model's chat template has no `enable_thinking` switch, so the flag is a no-op and has been dropped from the launch command.
+
+> **Context window:** the 262K context is native to this model (read from its `config.json`), so there is no `--max-context` flag — `mlx_lm.server` uses the model's own context length.
 
 > **Requires `mlx-lm >= 0.31`** (the `qwen3_5` architecture in this model is unsupported by older releases; upgrade with `pip install --upgrade mlx-lm`).
 
-### Memory Budget (Mac Unified Memory, 4-bit KV cache)
+### Memory Budget (Mac Unified Memory, 4-bit KV cache, approximate)
 
 | Component | 64K ctx | 256K ctx |
 |---|---|---|
-| LLM weights (27B ternary 2-bit, MLX) | 7.57GB | 7.57GB |
-| KV cache (4-bit, 16 full-attn layers) | 1.07GB | 4.30GB |
-| Linear-attention state (48 layers, fixed) | 0.08GB | 0.08GB |
+| LLM weights (9B 4-bit, MLX) | ~5.3GB | ~5.3GB |
+| KV cache (4-bit, 8 full-attn layers) | ~0.5GB | ~2.0GB |
+| Linear-attention state (24 layers, fixed) | ~0.05GB | ~0.05GB |
 | Embeddings (in-process, MiniLM) | 0.24GB | 0.24GB |
 | Runtime overhead | 1.30GB | 1.30GB |
-| **Total** | **~10.3GB** | **~13.5GB** |
+| **Total** | **~7.4GB** | **~8.9GB** |
 
 ### CLI Flags
 
@@ -217,38 +226,23 @@ All values read from env vars with sensible defaults. Key settings:
 
 ```bash
 # Models
-LLM_MODEL=prism-ml/Ternary-Bonsai-27B-mlx-2bit
+LLM_MODEL=Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit
 LLM_BASE_URL=http://localhost:8080/v1
 LLM_API_KEY=not-needed
 LLM_TEMPERATURE=0.25
 LLM_MAX_TOKENS=2048
-LLM_NUM_CTX=262144
+LLM_TIMEOUT=180
 
 # Embeddings (local in-process)
-EMBED_BACKEND=huggingface
 EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
 
-# Search
+# Search / fetch
 SEARCH_RESULTS_PER_QUERY=8
-SEARCH_RERANK_TOP_N=10
-SEARCH_RERANK_USE_HOST_DEDUP=1
-SEARCH_SINCE_DAYS=0
-SEARCH_RECENCY_BOOST=0.05
-FETCH_LIMIT=15
-
-# Fetch
-MAX_PAGE_CHARS=10000
 REQUEST_TIMEOUT=12
-FETCH_CONCURRENCY=5
+MAX_PAGE_CHARS=5000
 
-# Analysis (added in optimization pass)
-ANALYSIS_SNIPPET_CHARS=4000
-ANALYSIS_TEMPERATURE=0.1
-
-# Iteration / loop
-MAX_ITERATIONS=2                 # .env overrides to 5
-MIN_FETCHED_FOR_STOP=3
-MIN_FACTS_FOR_STOP=5
+# Agent loop
+MAX_AGENT_STEPS=12               # max tool-call turns per run
 
 # Memory
 MEMORY_DIR=advanced_memory
@@ -277,24 +271,28 @@ lite-deep-research-agent/
 ├── .env                    # Configuration (edit directly)
 │
 ├── research_agent/
-│   ├── __init__.py
+│   ├── __init__.py         # re-exports run()
 │   ├── __main__.py         # Entry point (loads .env, runs CLI)
 │   ├── config.py           # All env-read constants
-│   ├── tools.py            # ResearchTools, LLM/embedder/vectorstore factories,
-│   │                       #   DDG search, trafilatura fetch_url, helpers
-│   ├── state.py            # ResearchState, helpers (append_message/append_error)
-│   ├── memory.py           # Chroma add/query with recency boosting
-│   ├── nodes.py            # All orchestrator nodes (plan/search/fetch/analyze/...)
-│   ├── graph.py            # create_research_graph() — compiles the pipeline
-│   ├── agent.py            # AdvancedResearchAgent — synchronous stream + logging
-│   └── cli.py              # Interactive REPL, saves report to reports/
+│   ├── agent.py            # run() — custom tool-calling loop
+│   ├── llm.py              # system prompt + tool-call parsing
+│   ├── memory.py           # Chroma add/query, Scratchpad
+│   ├── logutil.py          # colors, previews, per-step tool-call logging
+│   ├── cli.py              # Interactive REPL, saves report to reports/
+│   └── tools/
+│       ├── __init__.py     # @tool registry, auto-discovery, catalog, init_tools
+│       ├── base.py         # factories + helpers (was tools.py)
+│       ├── web_search.py   # web_search tool (DuckDuckGo)
+│       ├── fetch_page.py   # fetch_page tool (trafilatura)
+│       ├── memory_tools.py # recall_memory / remember tools
+│       └── finalize.py     # final_answer tool + sentinel
 │
 └── scripts/
     ├── setup.sh            # pip install + mlx_lm setup
     └── serve.sh            # Launch mlx_lm.server
 ```
 
-> Note: there is **no** `llm.py` / `search.py` / `fetch.py` / `sub_agent.py` — those were from the earlier sub-agent design. The current code consolidates everything into `tools.py` + `nodes.py`.
+> Note: the removed LangGraph pipeline (`nodes.py` / `graph.py` / `state.py`) is no longer in the repo; §1–§13 describe it as design history.
 
 ---
 
@@ -325,11 +323,13 @@ lite-deep-research-agent/
 | Done | Structured fact extraction with source URLs | ✅ |
 | Done | Larger analysis context + lower analysis temperature | ✅ |
 | Done | Fix recency date-filter bug (`site:news`) | ✅ |
+| Done | Fix trafilatura ≥ 2.1 fetch (removed `timeout` kwarg → config `DOWNLOAD_TIMEOUT`) | ✅ |
+| Done | LLM-driven coverage assessment in `should_continue` (§13.2) | ✅ |
+| Done | Cross-source fact deduplication (§13.3) | ✅ |
+| Done | Memory self-retrieval fix (§13.4) | ✅ |
 | P1 | Orchestrator + parallel sub-agent `Send` fan-out architecture | ⬜ not started |
 | P1 | Cross-encoder reranking for search results | ⬜ |
-| P1 | LLM-driven coverage assessment in `should_continue` (replace heuristic) | ⬜ |
 | P1 | Pydantic structured output for `plan_node` (replace YAML) | ⬜ |
-| P2 | Cross-source fact deduplication (cosine similarity) | ⬜ |
 | P2 | Human-in-the-loop checkpoints | ⬜ |
 | P2 | Gradio web UI | ⬜ |
 | P2 | Markdown report export with references | ⬜ |
@@ -349,20 +349,17 @@ This section expands on the not-yet-implemented improvements ("remaining improve
 - **Why:** YAML parsing is fragile — small model deviations (code fences, indentation) break the plan and force a fallback to the raw query. The handoff explicitly calls for no YAML parsing.
 - **What:** Use `tools.llm.with_structured_output(PlanOutput)` returning `search_queries`, `key_aspects`, `gaps_to_address`. Adds robustness and removes the `NO_THINK_FLAG`/`_with_no_think` hack.
 
-### 13.2 LLM-driven coverage assessment in `should_continue` (replace heuristic)
-- **Where:** `should_continue_node` in `nodes.py` (currently counts `fetched < 3`, `facts < 5`, or `plan_gaps`).
-- **Why:** Pure thresholds don't measure *coverage* — redundant facts can satisfy the count while real gaps remain, or vice versa. Next-round queries are naive concatenations (`f"{query} {gap}"`).
-- **What:** Add an LLM call (structured output) that reads the extracted facts + gaps and decides `coverage_sufficient` plus *refined* follow-up queries targeting the actual gap (not string concat). Keep the `MAX_ITERATIONS` hard cap.
+### 13.2 LLM-driven coverage assessment in `should_continue` — ✅ IMPLEMENTED
+- **Where:** `should_continue_node` + `_assess_coverage` in `nodes.py`.
+- **Implementation:** The LLM reads the query, the plan's `KEY_ASPECTS`, and up to `COVERAGE_FACTS_MAX` extracted facts, then returns `{"sufficient": bool, "missing": [...], "new_queries": [...]}`. Targeted `new_queries` replace the old naive `f"{query} {gap}"` concatenation (which remains as the fallback when `missing` is present but `new_queries` is empty). The `MAX_ITERATIONS` hard cap is unchanged. On LLM/parse failure (or `COVERAGE_ASSESSMENT_ENABLED=0`), the original count/gap heuristic runs.
 
-### 13.3 Cross-source fact deduplication
-- **Where:** after `analyze_node` (or in `should_continue`), before synthesis.
-- **Why:** Facts accumulate across pages with no merging; near-duplicate facts from different sources inflate the report and waste context.
-- **What:** Embed each fact and drop near-duplicates above a cosine threshold (e.g. 0.85), mirroring the original `aggregate_node` design. The structured `source_url` per fact makes keeping a canonical source trivial.
+### 13.3 Cross-source fact deduplication — ✅ IMPLEMENTED
+- **Where:** `_dedupe_facts()` in `nodes.py`, applied at the end of `analyze_node`.
+- **Implementation:** Each fact's claim (source suffix stripped) is embedded; facts with cosine similarity ≥ `FACT_DEDUP_THRESHOLD` (default 0.9) to an already-kept fact are dropped. Falls back to the undeduped list on embedding failure; `FACT_DEDUP_ENABLED=0` disables.
 
-### 13.4 Memory self-retrieval fix
-- **Where:** graph edges / ordering in `graph.py` + `memory_node` in `nodes.py`.
-- **Why:** `fetch_node` writes pages to Chroma *before* `memory_node` reads, so the memory node largely re-retrieves the just-fetched content rather than genuinely prior knowledge.
-- **What:** Query memory *before* fetch (so it reflects prior runs), or tag writes with the current run id and exclude them from the memory read. Makes memory a real cross-run knowledge base.
+### 13.4 Memory self-retrieval fix — ✅ IMPLEMENTED
+- **Where:** `memory_node` in `nodes.py`.
+- **Implementation:** Retrieved chunks whose `metadata.url` matches a page fetched during the current run are filtered out, so memory only contributes prior-run knowledge (current-run pages already flow in via `extracted_facts`). Chroma writes still happen in `fetch_node`; the exclusion is done read-side.
 
 ### 13.5 Better analysis context & cross-source reconciliation
 - **Where:** `analyze_node` in `nodes.py`.
@@ -453,3 +450,89 @@ This section expands on the not-yet-implemented improvements ("remaining improve
 - **Why:** LDR has no compression; `extracted_facts` just grow. `minion.py:2880-3035` folds old history when context is full.
 - **What:** Lighter version — when `extracted_facts` exceeds `FACT_COMPRESS_THRESHOLD`, summarize/compress them so the synthesis context stays bounded (medium value given the fixed 256K ctx).
 
+
+---
+
+## 14. Agent Loop (current implementation)
+
+The LangGraph pipeline (§1–§13) is deprecated. The current system is a
+general-purpose local agent with a custom lightweight tool-calling loop —
+no agent framework.
+
+```
+user query
+   │
+   ▼
+┌──────────────────────── agent.run() ─────────────────────────┐
+│                                                              │
+│   messages = [system(build_system_prompt(TOOL_CATALOG)),     │
+│               user(query)]                                   │
+│                    │                                         │
+│                    ▼                                         │
+│              ┌──────────┐   plain text                       │
+│      ┌─────► │ llm.chat │ ──────────────►  answer            │
+│      │       └────┬─────┘                                    │
+│      │            │  {"tool": "<name>", "args": {...}}       │
+│      │            ▼                                          │
+│      │     TOOL_REGISTRY[name](**args)                       │
+│      │       web_search · fetch_page · recall_memory ·       │
+│      │       remember · final_answer (sets sentinel → stop)  │
+│      │            │                                          │
+│      └────────────┘  tool result appended to messages        │
+│                                                              │
+│   capped at MAX_AGENT_STEPS (default 12); empty output gets  │
+│   one AGENT_NUDGE retry; bad args fed back as tool result    │
+└──────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+   DuckDuckGo (ddgs) · trafilatura · Chroma (./advanced_memory/)
+   LLM: mlx_lm.server OpenAI /v1 at LLM_BASE_URL
+```
+
+### 14.1 Layout
+
+| File | Role |
+|---|---|
+| `research_agent/tools/__init__.py` | `@tool` decorator, `TOOL_REGISTRY`, submodule auto-discovery, `build_catalog()`, `init_tools()`/`get_shared()` |
+| `research_agent/tools/base.py` | Original factories + helpers (was `tools.py`): `build_tools`, `run_ddg_search`, `fetch_url`, `_extract_json_object`, `count_tokens`, … |
+| `research_agent/tools/web_search.py` | `web_search(query, max_results=8)` → `[{url, title, snippet}]` |
+| `research_agent/tools/fetch_page.py` | `fetch_page(url)` → `{url, title, text}` or error dict |
+| `research_agent/tools/memory_tools.py` | `recall_memory(query, top_k=5)`, `remember(text, title="")` |
+| `research_agent/tools/finalize.py` | `final_answer(answer)` — sets a sentinel the loop reads to terminate |
+| `research_agent/llm.py` | `build_system_prompt(catalog)`, `chat(messages, llm)` → `(text, toolcall_or_none)` |
+| `research_agent/agent.py` | `run(query)` — the step loop |
+
+Adding a tool = create `tools/<name>.py` with a `@tool`-decorated function.
+Submodules are auto-imported on package import; no other wiring.
+
+### 14.2 Tool-call format
+
+Robust for a weak 2-bit local model. The system prompt instructs: to use a
+tool, reply with ONLY a JSON block; ONE tool call per turn:
+
+    ```json
+    {"tool": "<name>", "args": {"<arg>": <value>}}
+    ```
+
+Any other reply is treated as the final answer. Parsing reuses
+`_extract_json_object` (tolerates code fences / surrounding prose); a parsed
+dict with a string `tool` key counts as a tool call.
+
+### 14.3 Loop algorithm (`agent.run`)
+
+1. `messages = [system(catalog), user(query)]`.
+2. For `step` in `1..MAX_AGENT_STEPS` (default 12):
+   - `text, call = llm.chat(messages, llm)`.
+   - Empty output → append the nudge (`config.AGENT_NUDGE`) and retry once
+     (the §13.16 pattern); still empty → stop with an error.
+   - No tool call → `text` is the final answer; stop.
+   - Tool call → look up `TOOL_REGISTRY`; execute with `**args`.
+     `TypeError` (bad args) and other exceptions are caught and fed back to
+     the model as the tool result. Append the assistant message and a
+     tool-result message. `final_answer` (or its sentinel) ends the loop.
+3. Per-step logging via `logutil.tool_step`: `step N | tool=<name> | preview`.
+4. Returns `{query, answer, steps, errors}`.
+
+Shared `ResearchTools` (llm/embedder/vectorstore/text_splitter) are built
+once via `build_tools()` and passed to tool modules through
+`tools.init_tools()` at loop start.

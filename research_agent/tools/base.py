@@ -33,7 +33,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 import trafilatura
 
-from . import config
+from .. import config
 
 
 @dataclass
@@ -77,6 +77,35 @@ def create_text_splitter() -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
         chunk_size=config.CHUNK_SIZE, chunk_overlap=config.CHUNK_OVERLAP
     )
+
+
+def _messages_to_text(messages: Any) -> str:
+    parts: List[str] = []
+    for m in messages:
+        content = getattr(m, "content", m)
+        if isinstance(content, list):
+            content = " ".join(
+                c.get("text", "") if isinstance(c, dict) else str(c) for c in content
+            )
+        parts.append(str(content))
+    return "\n".join(parts)
+
+
+def count_tokens(embedder: Embeddings, text: str) -> int:
+    """Estimate token count for a prompt using the embedder's tokenizer when
+    available, falling back to a ~4 chars/token heuristic."""
+    text = text or ""
+    try:
+        if hasattr(embedder, "encode"):
+            return len(embedder.encode(text))  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        if hasattr(embedder, "tokenizer") and embedder.tokenizer is not None:  # type: ignore[attr-defined]
+            return len(embedder.tokenizer.tokenize(text))  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return max(1, len(text) // 4)
 
 
 def build_tools() -> ResearchTools:
@@ -170,7 +199,11 @@ def run_ddg_search(
 @traceable(run_type="retriever", name="Fetch URL")
 def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple[str, str]]:
     try:
-        downloaded = trafilatura.fetch_url(url, timeout=timeout)
+        # trafilatura >= 2.1 has no `timeout` kwarg on fetch_url; the download
+        # timeout is set via the config object instead.
+        dl_config = trafilatura.settings.use_config()
+        dl_config.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(timeout))
+        downloaded = trafilatura.fetch_url(url, config=dl_config)
     except Exception:
         return None
     if not downloaded:

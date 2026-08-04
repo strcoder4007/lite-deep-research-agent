@@ -1,8 +1,9 @@
 # Lite Deep Research Agent
 
-Local deep research agent built on LangGraph. It plans search queries from a
-user question, searches the web, fetches and extracts page content, iterates
-when coverage is thin, and synthesizes a grounded, sourced report.
+General-purpose local agent with a **decorated tool registry** and a custom,
+lightweight tool-calling loop (no LangGraph). The model answers questions by
+calling tools — web search, page fetch, long-term memory — one JSON tool call
+per turn, until it produces a final answer.
 
 The LLM runs locally via an **OpenAI-compatible server** (`mlx_lm.server`,
 Apple Silicon). Embeddings run **in-process** via HuggingFace
@@ -23,64 +24,79 @@ pip install -r requirements.txt
 # 2. Install / upgrade mlx-lm (the model needs a recent version)
 pip install --upgrade mlx-lm
 
-# 3. Start the LLM server (downloads the model on first run, ~8.5 GB)
-#    IMPORTANT: keep thinking disabled — see note below.
+# 3. Start the LLM server (downloads the model on first run, ~5 GB)
 mlx_lm.server \
-  --model "prism-ml/Ternary-Bonsai-27B-mlx-2bit" \
-  --port 8080 \
-  --chat-template-args '{"enable_thinking":false}'
+  --model "Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit" \
+  --port 8080
 
 # 4. In another terminal, run the agent
 python -m research_agent
 ```
 
-> **Why `enable_thinking:false`?** This is a reasoning model. When thinking is
-> enabled, the OpenAI `/v1` response returns the reasoning trace in a
-> non-standard `reasoning` field and leaves `content` empty — and LangChain's
-> `ChatOpenAI` client drops that field, so fact extraction gets nothing.
-> Disabling thinking makes the model answer directly (fast, `content` always
-> populated). The flag is only honored at server launch, not per-request.
+> **Note:** the server binds the port immediately and loads the weights lazily
+> on the first request — silence after "Download complete" means it's ready,
+> not stuck. The first generation request pays the model-load cost.
 
 ## Run
 
 ```bash
-# Interactive REPL (type a query)
+# Interactive REPL (type or pick a query); per-step tool calls are printed
 python -m research_agent
-
-# Node-by-node timing (default)
-python -m research_agent --verbose
-
-# Custom iteration limit
-python -m research_agent --iterations 3
 ```
 
-Reports are saved to `reports/report_<hash>.txt`.
+Reports (final answers) are saved to `reports/report_<hash>.txt`.
 
 ## Architecture
 
-A single sequential LangGraph `StateGraph` pipeline (monolithic; `fetch`
-parallelizes its own I/O internally):
+A custom tool-calling loop (`agent.py: run()`), no agent framework:
 
 ```
-plan → search → fetch → analyze → should_continue ──"synthesize"──▶ memory → synthesize → END
-                          ▲                          │
-                          └────────"search"──────────┘  (loop back, capped at MAX_ITERATIONS)
+user query
+   │
+   ▼
+┌──────────────────────── agent.run() ─────────────────────────┐
+│                                                              │
+│   messages = [system prompt (tool catalog), user query]      │
+│                    │                                         │
+│                    ▼                                         │
+│              ┌──────────┐   plain text                       │
+│      ┌─────► │ llm.chat │ ──────────────►  FINAL ANSWER      │
+│      │       └────┬─────┘                                    │
+│      │            │  {"tool": "<name>", "args": {...}}       │
+│      │            ▼                                          │
+│      │     TOOL_REGISTRY[name](**args)                       │
+│      │       web_search · fetch_page · recall_memory ·       │
+│      │       remember · final_answer (ends the loop)         │
+│      │            │                                          │
+│      └────────────┘  tool result appended to messages        │
+│                                                              │
+│   loop capped at MAX_AGENT_STEPS (default 12)                │
+└──────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+   external world: DuckDuckGo · trafilatura · Chroma
+   LLM: mlx_lm.server (OpenAI-compatible /v1, localhost:8080)
 ```
 
-- **plan** — LLM decomposes the query into 4–5 search queries + key aspects + gaps.
-- **search** — DuckDuckGo (`ddgs`) per query, dedup by URL/host, embedding rerank with a recency bonus.
-- **fetch** — parallel `trafilatura` fetch (semaphore-limited), writes each page to Chroma memory.
-- **analyze** — per-page LLM fact extraction; each fact carries a `source_url`. JSON is parsed defensively (tolerates code fences / schema drift).
-- **should_continue** — heuristic loop: continue if too few pages/facts or gaps remain; otherwise proceed. Hard cap at `MAX_ITERATIONS`.
-- **memory** — Chroma query with the original query (+ gaps/aspects) for broad context.
-- **synthesize** — structured report (Executive Summary → Findings → Analysis → Conclusion → Notes) with inline source markers.
+- **Tool registry** (`research_agent/tools/`) — decorating a function with
+  `@tool` in any `tools/*.py` module is the only wiring needed; submodules
+  are auto-discovered on package import. Built-in tools: `web_search`,
+  `fetch_page`, `recall_memory`, `remember`, `final_answer`.
+- **tools/base.py** — the original factories + helpers (`build_tools`,
+  `run_ddg_search`, `fetch_url`, `_extract_json_object`, `count_tokens`, …),
+  re-exported from `research_agent.tools`.
+- **llm.py** — builds the system prompt from the tool catalog and parses the
+  single-JSON tool call (`_extract_json_object` tolerates code fences).
+- **Bad args / unknown tools** are caught and fed back to the model as the
+  tool result; empty model output gets one nudge retry.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Agent framework | LangGraph (`StateGraph`, sequential pipeline) |
-| LLM | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` via `mlx_lm.server` (OpenAI-compatible) |
+| Agent loop | Custom tool-calling loop (`agent.py`), no framework |
+| Tool registry | `@tool` decorator + auto-discovery (`research_agent/tools/`) |
+| LLM | `Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit` via `mlx_lm.server` (OpenAI-compatible) |
 | LLM client | `langchain_openai.ChatOpenAI` pointed at the local server |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` in-process via `langchain_huggingface` (384d) |
 | Vector DB | Chroma (persisted to `./advanced_memory/`) |
@@ -94,10 +110,9 @@ Edit `.env` directly. Key settings:
 
 ```bash
 # LLM (OpenAI-compatible server)
-LLM_MODEL=prism-ml/Ternary-Bonsai-27B-mlx-2bit
+LLM_MODEL=Jackrong/MLX-Qwen3.5-9B-DeepSeek-V4-Flash-4bit
 LLM_BASE_URL=http://localhost:8080/v1
 LLM_API_KEY=not-needed
-LLM_NUM_CTX=262144            # native context; documentation only (no server flag)
 LLM_TIMEOUT=180               # seconds; LLM request timeout
 
 # Embeddings (in-process)
@@ -105,13 +120,11 @@ EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
 
 # Search / fetch
 SEARCH_RESULTS_PER_QUERY=8
-FETCH_LIMIT=15
-MAX_PAGE_CHARS=10000
-FETCH_CONCURRENCY=5
+MAX_PAGE_CHARS=5000
+REQUEST_TIMEOUT=12
 
-# Iteration
-MAX_ITERATIONS=5
-MIN_FACTS_FOR_STOP=5
+# Agent loop
+MAX_AGENT_STEPS=12            # max tool-call turns per run
 
 # Memory
 MEMORY_DIR=advanced_memory
@@ -127,22 +140,23 @@ LANGCHAIN_API_KEY=<your-key>
 LANGCHAIN_PROJECT=lite-deep-research
 ```
 
-## Memory Budget (Apple Silicon, 4-bit KV cache)
+## Memory Budget (Apple Silicon, 4-bit KV cache, approximate)
 
 | Component | 64K ctx | 256K ctx |
 |---|---|---|
-| LLM weights (27B ternary 2-bit, MLX) | 7.57 GB | 7.57 GB |
-| KV cache (4-bit, 16 full-attn layers) | 1.07 GB | 4.30 GB |
-| Linear-attention state (48 layers, fixed) | 0.08 GB | 0.08 GB |
+| LLM weights (9B 4-bit, MLX) | ~5.3 GB | ~5.3 GB |
+| KV cache (4-bit, 8 full-attn layers) | ~0.5 GB | ~2.0 GB |
+| Linear-attention state (24 layers, fixed) | ~0.05 GB | ~0.05 GB |
 | Embeddings (in-process, MiniLM) | 0.24 GB | 0.24 GB |
 | Runtime overhead | 1.30 GB | 1.30 GB |
-| **Total** | **~10.3 GB** | **~13.5 GB** |
+| **Total** | **~7.4 GB** | **~8.9 GB** |
 
-> The model's native context is 262K (256K). Even the full window fits ~13.5 GB
-> on a 16 GB Mac with the 4-bit KV cache, so there's no need to cap context.
+> The model's native context is 262K (256K). Even the full window fits
+> comfortably on a 16 GB Mac, so there's no need to cap context.
 
-> **Performance:** this 2-bit 27B runs at roughly ~18–26 tok/s on M-series, so
-> multi-page research runs can take a while — that's the model, not the pipeline.
+> **Performance:** this 4-bit 9B is much lighter and faster than the old 27B
+> 2-bit, but multi-page research runs still take a while — that's the model,
+> not the pipeline.
 
 ## Project Structure
 
@@ -155,17 +169,21 @@ lite-deep-research-agent/
 ├── .env                    # Configuration (edit directly)
 │
 ├── research_agent/
-│   ├── __init__.py
+│   ├── __init__.py         # re-exports run()
 │   ├── __main__.py         # Entry point (loads .env, runs CLI)
-│   ├── config.py           # All env-read constants
-│   ├── tools.py            # LLM/embedder/vectorstore factories, DDG search,
-│   │                       #   trafilatura fetch, JSON-extraction helper
-│   ├── state.py            # ResearchState, helpers
-│   ├── memory.py           # Chroma add/query with recency boosting
-│   ├── nodes.py            # Orchestrator nodes (plan/search/fetch/analyze/...)
-│   ├── graph.py            # create_research_graph() — compiles the pipeline
-│   ├── agent.py            # AdvancedResearchAgent — synchronous stream + logging
-│   └── cli.py              # Interactive REPL, saves report to reports/
+│   ├── config.py           # All env-read constants (incl. MAX_AGENT_STEPS)
+│   ├── agent.py            # run() — custom tool-calling loop
+│   ├── llm.py              # system prompt + tool-call parsing
+│   ├── memory.py           # Chroma add/query, Scratchpad
+│   ├── logutil.py          # colors, previews, per-step tool-call logging
+│   ├── tools/
+│   │   ├── __init__.py     # @tool registry, auto-discovery, catalog, init_tools
+│   │   ├── base.py         # original factories + helpers (was tools.py)
+│   │   ├── web_search.py   # web_search tool (DuckDuckGo)
+│   │   ├── fetch_page.py   # fetch_page tool (trafilatura)
+│   │   ├── memory_tools.py # recall_memory / remember tools
+│   │   └── finalize.py     # final_answer tool + sentinel
+│   └── cli.py              # Interactive REPL, saves answer to reports/
 │
 └── scripts/
     ├── setup.sh            # pip install helper
