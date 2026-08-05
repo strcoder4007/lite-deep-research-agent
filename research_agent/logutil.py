@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
 from typing import Any, List, Optional, TextIO
 
 _USE_COLOR = os.getenv("NO_COLOR") is None and os.getenv("TERM", "") != "dumb"
@@ -220,17 +219,23 @@ def status_line(
     tokens: int,
     prompt_tokens: int,
     context_total: int,
+    ttft: float = 0.0,
 ) -> str:
-    """Persistent one-line status: tok/s, tokens, latency, context usage."""
+    """Persistent one-line status: tok/s, tokens in/out, latency, context usage."""
     tps = tokens / elapsed if elapsed > 0 and tokens else 0.0
+    out_tokens = max(tokens - prompt_tokens, 0)
     parts = [
         dim("  ── "),
         yellow(bold(f"{tps:.1f} tok/s")),
         dim("  ·  "),
-        cyan(f"{abbr(tokens)} tok"),
+        magenta(f"in {abbr(prompt_tokens)}"),
+        dim("  ·  "),
+        cyan(f"out {abbr(out_tokens)}"),
         dim("  ·  "),
         blue(f"{elapsed:.1f}s"),
     ]
+    if ttft > 0:
+        parts += [dim("  ·  "), dim("ttft ") + blue(f"{ttft:.2f}s")]
     if context_total > 0:
         parts += [dim("  ·  "), dim("ctx ") + context_bar(prompt_tokens, context_total, width=14)]
     return "".join(parts)
@@ -267,31 +272,39 @@ def run_summary(
     errors: List[str],
 ) -> str:
     """Return a colored end-of-run summary block."""
+    out_tokens = max(total_tokens - prompt_tokens, 0)
     lines = [
         "",
         header("═══ Run Summary ═══"),
-        f"  Steps:           {total_steps}",
-        f"  Total time:      {total_time:.1f}s",
+        dim("  Steps:   ") + bold(str(total_steps)),
+        dim("  Time:    ") + blue(f"{total_time:.1f}s"),
     ]
     if total_tool_time > 0:
-        lines.append(f"  Tool time:       {total_tool_time:.1f}s")
+        lines.append(dim("  Tools:   ") + yellow(f"{total_tool_time:.1f}s"))
     if total_fetch_time > 0:
-        lines.append(f"  Auto-fetch time: {total_fetch_time:.1f}s")
+        lines.append(dim("  Fetch:   ") + green(f"{total_fetch_time:.1f}s"))
     if total_tokens > 0:
         avg = total_tokens / total_time if total_time > 0 else 0
-        lines.append(f"  Avg speed:       {avg:.1f} tok/s")
-        lines.append(f"  Tokens:          {total_tokens} total ({prompt_tokens} prompt)")
+        lines.append(dim("  Speed:   ") + yellow(bold(f"{avg:.1f} tok/s")))
+        lines.append(
+            dim("  Tokens:  ")
+            + magenta(f"{abbr(prompt_tokens)} in")
+            + dim(" · ")
+            + cyan(f"{abbr(out_tokens)} out")
+            + dim(" · ")
+            + bold(f"{abbr(total_tokens)} total")
+        )
     if context_total > 0:
         lines.append(
-            "  Context:         "
+            dim("  Context: ")
             + context_bar(context_used, context_total)
         )
     if errors:
-        lines.append(f"  Errors:          {len(errors)}")
+        lines.append(dim("  Errors:  ") + red(bold(str(len(errors)))))
         for err in errors:
             lines.append(f"    {error(err)}")
     else:
-        lines.append(f"  Errors:          {success('none')}")
+        lines.append(dim("  Errors:  ") + success("none"))
     lines.append(header("═══"))
     return "\n".join(lines)
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from .. import config
 from . import tool
-from .base import fetch_url
+from .fetch_page import fetch_page
 
 
 @tool
@@ -16,20 +16,11 @@ def fetch_pages(
     """Fetch multiple web pages concurrently and return their content."""
     results: List[Dict[str, str]] = []
 
-    def _fetch(url: str) -> Optional[Dict[str, str]]:
-        result = fetch_url(url)
-        if result is None:
-            return {"url": url, "error": "could not fetch or extract page content"}
-        title, text = result
-        return {"url": url, "title": title, "text": text}
-
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch, url): url for url in urls}
+        futures = {executor.submit(fetch_page, url): url for url in urls}
         for future in futures:
             try:
-                result = future.result()
-                if result is not None:
-                    results.append(result)
+                results.append(future.result())
             except Exception:
                 url = futures[future]
                 results.append({"url": url, "error": "fetch failed"})

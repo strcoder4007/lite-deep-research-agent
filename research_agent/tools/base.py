@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -40,6 +43,9 @@ from .. import config
 _ddg_session: Optional[DDGS] = None
 _ddg_session_lock = threading.Lock()
 
+_fetch_cache: Dict[str, Tuple[float, Optional[Tuple[str, str]]]] = {}
+_fetch_cache_lock = threading.Lock()
+
 
 def _get_ddg_session() -> DDGS:
     """Return a thread-local DDGS session, creating one if needed."""
@@ -72,6 +78,10 @@ def create_llm(
         max_tokens=max_tokens,
         timeout=config.LLM_TIMEOUT,
         max_retries=2,
+        # Ask the server for token usage on streamed responses
+        # (stream_options: {include_usage: true}); without it the agent's
+        # token stats, budget guard, and compression trigger never fire.
+        stream_usage=True,
     )
 
 
@@ -264,18 +274,64 @@ def run_ddg_search(
     return cleaned
 
 
+def _parse_reddit_json(raw: str, url: str) -> Tuple[str, str]:
+    """Parse reddit's ``.json`` response into (text, title)."""
+    data = json.loads(raw)
+    parts: List[str] = []
+    title = url
+    if isinstance(data, list):
+        items = [i for i in data if isinstance(i, dict)]
+    elif isinstance(data, dict):
+        items = [data]
+    else:
+        items = []
+    for item in items:
+        children = (item.get("data") or {}).get("children") or []
+        for child in children:
+            d = (child.get("data") or {}) if isinstance(child, dict) else {}
+            if d.get("title"):
+                title = d["title"]
+            text = d.get("selftext") or d.get("body")
+            if text:
+                parts.append(text)
+    return "\n\n".join(p for p in parts if p), title
+
+
 @traceable(run_type="retriever", name="Fetch URL")
 def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple[str, str]]:
+    if config.FETCH_CACHE_TTL > 0:
+        with _fetch_cache_lock:
+            hit = _fetch_cache.get(url)
+            if hit and time.time() - hit[0] < config.FETCH_CACHE_TTL:
+                return hit[1]
+
+    # Reddit blocks scrapers; use the JSON endpoint instead.
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if host.endswith("reddit.com"):
+        try:
+            sep = "&" if "?" in url else "?"
+            json_url = f"{url}{sep}.json"
+            with urllib.request.urlopen(json_url, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            text, title = _parse_reddit_json(raw, url)
+            if not text:
+                return ("error", "extraction failed (reddit JSON could not be parsed)")
+            if len(text) > config.MAX_PAGE_CHARS:
+                text = text[: config.MAX_PAGE_CHARS]
+            return (title, text)
+        except Exception as exc:
+            return ("error", f"network error: {type(exc).__name__}: {exc}")
+
     try:
-        # trafilatura >= 2.1 has no `timeout` kwarg on fetch_url; the download
-        # timeout is set via the config object instead.
         dl_config = trafilatura.settings.use_config()
         dl_config.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(timeout))
         downloaded = trafilatura.fetch_url(url, config=dl_config)
-    except Exception:
-        return None
+    except Exception as exc:
+        return ("error", f"network error: {type(exc).__name__}: {exc}")
+
     if not downloaded:
-        return None
+        return ("error", "no content downloaded (empty response or blocked by server)")
+
     text = trafilatura.extract(
         downloaded,
         output_format="markdown",
@@ -284,12 +340,13 @@ def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple
         include_tables=False,
     )
     if not text:
-        return None
+        return ("error", "extraction failed (page content could not be parsed)")
+
     if len(text) > config.MAX_PAGE_CHARS:
         text = text[: config.MAX_PAGE_CHARS]
     metadata = trafilatura.extract_metadata(downloaded)
     title = (metadata.title.strip() if metadata and metadata.title else None) or url
-    return title, text
+    return (title, text)
 
 
 def timestamp() -> str:

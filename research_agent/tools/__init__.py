@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 # create_embedder, create_vectorstore, create_text_splitter, build_tools,
 # ResearchTools, timestamp, ...).
 from .base import *  # noqa: F401,F403
-from .base import ResearchTools, _extract_json_object  # explicit re-exports
+from .base import ResearchTools, _extract_json_object as _extract_json_object  # explicit re-exports
 
 # name -> {"name", "description", "fn", "schema"}
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
@@ -96,7 +96,7 @@ def build_catalog() -> str:
 def _discover_tool_modules() -> None:
     """Import every ``tools/*.py`` submodule so their @tool decorators run."""
     skip = {"base"}
-    for info in pkgutil.iter_modules(__path__):
+    for info in pkgutil.iter_modules(__path__):  # noqa: F405
         if info.name in skip or info.name.startswith("_"):
             continue
         import_module(f"{__name__}.{info.name}")

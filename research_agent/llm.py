@@ -28,7 +28,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
 from . import config, logutil
-from .tools import _extract_json_object
+from .tools import _extract_json_object, count_tokens
 _PROMPT_TEMPLATE = """You are a research assistant running on the user's local machine. Your job is to produce thorough, well-sourced answers to research questions.
 
 Current date: {current_date}
@@ -57,15 +57,23 @@ You can call multiple tools in a single turn by returning a JSON array:
 
 ## Search strategy
 - On the FIRST turn, plan the COMPLETE set of independent searches needed to cover the topic from multiple angles, and emit ALL of them in a single JSON array. Do not search one query at a time.
+- One search round is enough: plan ALL searches upfront. Do NOT run another round of searches afterwards unless the results were genuinely missing or irrelevant AND you have a specific new sub-question that was not already covered. Never repeat or lightly rephrase an earlier query.
 - Vary your search queries: use different phrasings, include the current date/year for time-sensitive topics, and cover sub-topics separately.
 - Aim for 4-8 diverse `web_search` calls on the first turn. More is fine for complex topics.
+- Use `since_days` and `time_limit` parameters on `web_search` for time-sensitive queries (e.g. since_days=7 for "this week", time_limit="w" for past week).
 - After search results arrive, the top URLs are fetched automatically. Only call `fetch_page` yourself for specific extra URLs beyond those.
 - Prefer authoritative sources: official docs, academic papers, reputable news outlets, and primary sources over blog posts or social media.
-- If a search returns mostly low-quality or irrelevant results, rephrase the query and search again with different keywords.
+- If a search returned mostly low-quality or irrelevant results, rephrase ONLY that specific query once with different keywords — do not launch a whole new round.
 - Use `recall_memory` when the question may relate to earlier conversations or previously researched topics.
 - Use `remember` to store durable facts, preferences, and research findings worth keeping.
 - Do not invent tool results; wait for them. If a tool errors, adapt (rephrase the query, try another source) instead of repeating the same call.
 - Ground research answers in what the tools returned and cite source URLs when you use fetched information.
+- After auto-fetched pages are available, synthesize an answer from them. Do not launch another search round just to find more sources — the auto-fetch already pulled the top results.
+
+## Source quality
+- Prefer authoritative sources: official docs, academic papers, reputable news outlets, and primary sources over blog posts or social media.
+- When sources disagree, flag the contradiction and prefer the more recent or authoritative source.
+- Cite source URLs inline so the user can verify each claim.
 
 ## Finishing
 - When you have everything needed to answer, call the `final_answer` tool with the complete answer, or reply with the answer as plain text.
@@ -103,43 +111,96 @@ def _parse_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def chat(
-    messages: List[BaseMessage], llm: BaseChatModel
+    messages: List[BaseMessage], llm: BaseChatModel, stream_final: bool = False
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """Send messages to the LLM.
 
     Returns (text, toolcalls, info) where:
       - toolcalls is a list of {"tool": name, "args": {...}} (empty list if no tool call)
-      - info is {"elapsed": float, "tokens": int, "prompt_tokens": int}
+      - info is {"elapsed": float, "tokens": int, "prompt_tokens": int, "ttft": float}
     """
     logutil._print(logutil.stage("llm") + " calling model ...")
     started = time.perf_counter()
-    response = llm.invoke(messages)
+    first_token_time: Optional[float] = None
+    chunks: List[str] = []
+    last_chunk: Any = None
+    token_usage: Dict[str, Any] = {}
+    _buffer: List[str] = []
+    _streaming = False
+    _structured_detected = False
+
+    for chunk in llm.stream(messages):
+        if first_token_time is None:
+            first_token_time = time.perf_counter()
+        # Usage usually arrives on a final content-less chunk, so collect
+        # it from every chunk instead of only the last content chunk.
+        usage_meta = getattr(chunk, "usage_metadata", None)
+        if usage_meta:
+            token_usage = {
+                "prompt_tokens": usage_meta.get("input_tokens", 0),
+                "completion_tokens": usage_meta.get("output_tokens", 0),
+                "total_tokens": usage_meta.get("total_tokens", 0),
+            }
+        else:
+            fallback_usage = (getattr(chunk, "response_metadata", None) or {}).get("token_usage")
+            if fallback_usage:
+                token_usage = fallback_usage
+        content = getattr(chunk, "content", "")
+        if content:
+            chunks.append(str(content))
+            last_chunk = chunk
+            # Heuristic: decide from the accumulated buffer whether this
+            # turn is structured (JSON tool call / fence) or plain text.
+            # Only plain text is streamed live; structured output never is.
+            if stream_final and not _streaming and not _structured_detected:
+                _buffer.append(str(content))
+                stripped = "".join(_buffer).strip()
+                if stripped.startswith(("{", "[", "```")):
+                    _structured_detected = True
+                elif len(stripped) > 50 and not any(c in stripped for c in "{["):
+                    # No structured markers after 50 chars — plain text
+                    # (the final answer), start streaming it live.
+                    _streaming = True
+                    print(logutil.C.CYAN, end="", flush=True)
+                    print(stripped, end="", flush=True)
+            elif _streaming and not _structured_detected:
+                # Continue streaming: chunks are deltas, print as-is.
+                print(str(content), end="", flush=True)
+
     elapsed = time.perf_counter() - started
+    ttft = first_token_time - started if first_token_time is not None else 0.0
 
-    content = getattr(response, "content", response)
-    if isinstance(content, list):
-        content = " ".join(
-            c.get("text", "") if isinstance(c, dict) else str(c) for c in content
-        )
-    text = str(content).strip()
+    text = "".join(chunks).strip()
 
-    token_usage: Dict[str, Any] = (
-        response.response_metadata.get("token_usage", {})
-        if hasattr(response, "response_metadata")
-        else {}
-    )
+    # If we were streaming plain text, print a newline at the end.
+    streamed = _streaming and not _structured_detected
+    if streamed:
+        print(logutil.C.RESET)
+        print()
+
+    response = last_chunk if last_chunk is not None else chunks[-1] if chunks else ""
     total_tokens = token_usage.get("total_tokens", 0)
     prompt_tokens = token_usage.get("prompt_tokens", 0)
-    info = {"elapsed": elapsed, "tokens": total_tokens, "prompt_tokens": prompt_tokens}
+    estimated = False
+    if not total_tokens and not prompt_tokens:
+        # Server ignored include_usage — fall back to a rough estimate so
+        # the budget guard / compression trigger still work.
+        estimated = True
+        prompt_tokens = sum(
+            count_tokens(None, str(getattr(m, "content", m))) for m in messages
+        )
+        total_tokens = prompt_tokens + count_tokens(None, text)
+    info = {"elapsed": elapsed, "tokens": total_tokens, "prompt_tokens": prompt_tokens, "ttft": ttft, "streamed": streamed}
 
     logutil._print(
         logutil.stage("llm")
         + logutil.dim(" done")
         + "\n"
-        + logutil.status_line(elapsed, total_tokens, prompt_tokens, config.LLM_NUM_CTX)
+        + logutil.status_line(elapsed, total_tokens, prompt_tokens, config.LLM_NUM_CTX, ttft)
+        + (logutil.dim(" (estimated)") if estimated else "")
     )
 
-    reasoning = response.additional_kwargs.get("reasoning", "")
+    reasoning = getattr(response, "additional_kwargs", {}).get("reasoning", "")
     if reasoning:
         logutil._print(logutil.dim(f"  [reasoning]\n{reasoning}"))
 

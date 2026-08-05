@@ -1,4 +1,4 @@
-# Handoff Document — lite-deep-research-agent
+# Handoff Document — tiny-deep-researcher
 
 ## Project Overview
 
@@ -41,7 +41,7 @@ been **removed**; HLD.md §1–§13 preserves it as design history.
 ## Project Structure
 
 ```
-lite-deep-research-agent/
+tiny-deep-researcher/
 ├── HLD.md                  # High-Level Design (§14 documents the current loop)
 ├── handoff.md              # This file
 ├── README.md               # User-facing readme

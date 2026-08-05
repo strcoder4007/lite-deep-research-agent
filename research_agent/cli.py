@@ -15,9 +15,9 @@ from .memory import ConversationMemory
 
 
 EXAMPLE_QUERIES = [
-    "Tell me all the good tv show episodes released in the last week.",
+    "I have a budget of $2,500 to build a local AI workstation for running 30B-70B quantized language models. Research the optimal CPU, GPU, RAM, motherboard, SSD, cooling, and power supply. Compare at least three complete builds, estimate real-world inference speeds, upgrade paths, energy consumption, and cost per token generated. Recommend the best value configuration for the next five years.",
     "What are the new open source llms released this week?",
-    "Tell me about the new Toyota GR GT, expected price, release date, specs",
+    "Design a local-first AI coding assistant capable of serving 100 concurrent users on a single RTX 4090. Compare vLLM, SGLang, TensorRT-LLM, llama.cpp, and ExLlamaV2, covering KV cache management, continuous batching, speculative decoding, memory usage, latency, throughput, and deployment architecture. End with a production-ready recommendation and implementation roadmap.",
 ]
 
 
@@ -37,7 +37,7 @@ def _choose_query() -> str:
 
 def main() -> int:
     history = ConversationMemory()
-    print(logutil.header("Lite Deep Research Agent"))
+    print(logutil.header("Tiny Deep Researcher"))
     print(logutil.dim("  conversational mode — type 'quit' to exit"))
     print(logutil.separator())
     turn = 0
@@ -56,9 +56,11 @@ def main() -> int:
         turn += 1
         result = run(query=query, verbose=True, history=history)
         report = result.get("answer", "")
-        print()
-        print(logutil.agent(""))
-        print(logutil.cyan(report))
+        if not result.get("streamed"):
+            # Streamed answers were already printed live during the run.
+            print()
+            print(logutil.agent(""))
+            print(logutil.cyan(report))
         if result.get("errors"):
             print()
             print(logutil.error(f"Errors ({len(result['errors'])}):"))

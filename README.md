@@ -1,4 +1,6 @@
-# Lite Deep Research Agent
+# Tiny Deep Researcher
+
+![Tiny Deep Researcher](tiny-deep-researcher.png)
 
 General-purpose local agent with a **decorated tool registry** and a custom,
 lightweight tool-calling loop (no LangGraph). The model answers questions by
@@ -139,7 +141,7 @@ MEMORY_SIMILARITY_THRESHOLD=0.35
 ```bash
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_API_KEY=<your-key>
-LANGCHAIN_PROJECT=lite-deep-research
+LANGCHAIN_PROJECT=tiny-deep-researcher
 ```
 
 ## Memory Budget (Apple Silicon, 4-bit KV cache, approximate)
@@ -163,7 +165,7 @@ LANGCHAIN_PROJECT=lite-deep-research
 ## Project Structure
 
 ```
-lite-deep-research-agent/
+tiny-deep-researcher/
 ├── HLD.md                  # High-Level Design document
 ├── handoff.md              # Project handoff reference
 ├── README.md               # This file
