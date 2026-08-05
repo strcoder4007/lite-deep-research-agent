@@ -27,13 +27,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
-from . import logutil
+from . import config, logutil
 from .tools import _extract_json_object
-_PROMPT_TEMPLATE = """You are a general-purpose local agent. Answer the user's request.
+_PROMPT_TEMPLATE = """You are a helpful, conversational research assistant running entirely on the user's local machine. You talk like a knowledgeable colleague: warm, direct, and concise.
 
 Current date: {current_date}
 Day of week: {day_of_week}
 
+## Personality & conversation
+- Be natural and conversational. This is a multi-turn chat: remember what the user said earlier, follow up coherently, and answer follow-up questions using the conversation history.
+- For casual chat (greetings, small talk, clarifications, questions you already know), just reply in plain text — no tools needed.
+- Ask a short clarifying question when the request is genuinely ambiguous, instead of guessing.
+- Match the user's tone and language. Keep answers well-structured (short paragraphs, lists where helpful) but never robotic.
+
+## Tools
 You have these tools:
 {catalog}
 
@@ -50,11 +57,19 @@ You can call multiple tools in a single turn by returning a JSON array:
 ]
 ```
 
-Rules:
-- You may call one or more tools per turn. After all tool results come back, continue.
-- When you have everything needed to answer, call the `final_answer` tool
-  with the complete answer, or reply with the answer as plain text.
-- Do not invent tool results; wait for them.
+## Tool-use rules
+- Plan first, then act once: before your first tool call, decide the COMPLETE set of independent calls the task needs (e.g. 6-8 different `web_search` queries covering different angles) and emit ALL of them together in a single JSON array on that turn. Do not dribble out one search per turn.
+- The top results of every `web_search` are fetched AUTOMATICALLY right after the search — you do not need to call `fetch_page` for them. You will receive the search hits and the fetched page contents together. Only call `fetch_page` yourself for specific extra URLs beyond those.
+- Use `web_search` whenever the answer depends on current, recent, or niche facts you are not certain about — never guess dates, versions, prices, or news.
+- For research questions, prefer several varied search queries over one: rephrase, cover sub-topics, and include the current date/year where relevant.
+- Use `recall_memory` when the question may relate to earlier conversations or previously researched topics.
+- Use `remember` to store durable facts, preferences, and research findings worth keeping.
+- Do not invent tool results; wait for them. If a tool errors, adapt (rephrase the query, try another source) instead of repeating the same call.
+- Ground research answers in what the tools returned and cite source URLs when you use fetched information.
+
+## Finishing
+- When you have everything needed to answer, call the `final_answer` tool with the complete answer, or reply with the answer as plain text.
+- Never output partial answers as tool calls; the final answer must stand on its own.
 """
 
 
@@ -119,13 +134,56 @@ def chat(
 
     logutil._print(
         logutil.stage("llm")
-        + f" done in {elapsed:.2f}s"
-        + (f" ({total_tokens} tok)" if total_tokens else "")
+        + logutil.dim(" done")
+        + "\n"
+        + logutil.status_line(elapsed, total_tokens, prompt_tokens, config.LLM_NUM_CTX)
     )
 
     reasoning = response.additional_kwargs.get("reasoning", "")
     if reasoning:
         logutil._print(logutil.dim(f"  [reasoning]\n{reasoning}"))
+
+    calls = _parse_tool_calls(text)
+    return text, calls if calls else [], info
+
+
+def stream_chat(
+    messages: List[BaseMessage], llm: BaseChatModel
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """Stream the LLM response, printing tokens as they arrive.
+
+    Returns (text, toolcalls, info) like chat(), but tokens are
+    printed to the terminal in real time.  Tool calls are collected
+    from the full streamed text, so the model must emit the complete
+    JSON block before the stream ends.
+    """
+    logutil._print(logutil.stage("llm") + " streaming ...")
+    started = time.perf_counter()
+    chunks: List[str] = []
+    total_tokens = 0
+    prompt_tokens = 0
+    for chunk in llm.stream(messages):
+        token = getattr(chunk, "content", "")
+        if token:
+            chunks.append(token)
+            print(token, end="", flush=True)
+        usage = getattr(chunk, "usage_metadata", None) or (
+            getattr(chunk, "response_metadata", {}) or {}
+        ).get("token_usage", {})
+        if isinstance(usage, dict):
+            total_tokens = usage.get("total_tokens", total_tokens)
+            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+    elapsed = time.perf_counter() - started
+    print()
+    text = "".join(chunks).strip()
+    info = {"elapsed": elapsed, "tokens": total_tokens, "prompt_tokens": prompt_tokens}
+
+    logutil._print(
+        logutil.stage("llm")
+        + logutil.dim(" done")
+        + "\n"
+        + logutil.status_line(elapsed, total_tokens, prompt_tokens, config.LLM_NUM_CTX)
+    )
 
     calls = _parse_tool_calls(text)
     return text, calls if calls else [], info

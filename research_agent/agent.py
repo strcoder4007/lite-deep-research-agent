@@ -92,7 +92,7 @@ def run(
 
     for step in range(1, max_steps + 1):
         started = time.perf_counter()
-        text, calls, info = llm.chat(messages, tools.llm)
+        text, calls, info = llm.stream_chat(messages, tools.llm)
         total_time += info["elapsed"]
         total_tokens += info["tokens"]
         total_prompt_tokens += info["prompt_tokens"]
@@ -100,7 +100,7 @@ def run(
         # Nudge retry once on empty/degenerate output (HLD §13.16 pattern).
         if not text.strip() and not calls:
             messages.append(HumanMessage(content=config.AGENT_NUDGE))
-            text, nudge_calls, nudge_info = llm.chat(messages, tools.llm)
+            text, nudge_calls, nudge_info = llm.stream_chat(messages, tools.llm)
             total_time += nudge_info["elapsed"]
             total_tokens += nudge_info["tokens"]
             total_prompt_tokens += nudge_info["prompt_tokens"]
@@ -117,34 +117,78 @@ def run(
                 logutil._print(logutil.tool_step(step, "final(text)", text))
             break
 
-        # Execute all tool calls in parallel.
-        step_errors: List[str] = []
-        step_results: Dict[str, Dict[str, Any]] = {}
+        # Execute all tool calls in parallel, keeping results aligned with
+        # the calls (several calls to the same tool must not overwrite).
         with ThreadPoolExecutor(max_workers=min(len(calls), config.FETCH_CONCURRENCY)) as executor:
-            futures = {
-                executor.submit(_execute_tool, call["tool"], call["args"], step): call
+            futures = [
+                executor.submit(_execute_tool, call["tool"], call["args"], step)
                 for call in calls
-            }
-            for future in futures:
-                name, result, call_errors, elapsed = future.result()
-                step_errors.extend(call_errors)
-                step_results[name] = result
-                if verbose:
-                    preview = _preview(result)
-                    logutil._print(
-                        logutil.tool_step(step, name, preview)
-                        + logutil.dim(f"  {elapsed:.1f}s")
-                    )
-                    logutil._print(logutil.tool_result(result))
+            ]
+            executed = [future.result() for future in futures]
 
-        errors.extend(step_errors)
+        for (name, result, call_errors, elapsed) in executed:
+            errors.extend(call_errors)
+            if verbose:
+                preview = _preview(result)
+                logutil._print(
+                    logutil.tool_step(step, name, preview)
+                    + logutil.dim(f"  {elapsed:.1f}s")
+                )
+                logutil._print(logutil.tool_result(result))
+
+        # Auto-fetch: pull the top URLs from any web_search results in
+        # parallel, without another model round-trip (fast research path).
+        fetched_urls = {
+            str(call["args"].get("url", ""))
+            for call in calls
+            if call["tool"] == "fetch_page"
+        }
+        auto_urls: List[str] = []
+        if config.AUTO_FETCH_TOP_N > 0:
+            for call, (name, result, _, _) in zip(calls, executed):
+                if name != "web_search" or not isinstance(result, list):
+                    continue
+                for item in result[: config.AUTO_FETCH_TOP_N]:
+                    url = item.get("url") if isinstance(item, dict) else None
+                    if (
+                        url
+                        and url not in fetched_urls
+                        and url not in auto_urls
+                        and len(auto_urls) < config.AUTO_FETCH_MAX_TOTAL
+                    ):
+                        auto_urls.append(url)
+        if auto_urls:
+            fetch_fn = get_tool("fetch_page")
+            if fetch_fn is not None:
+                if verbose:
+                    logutil._print(
+                        logutil.dim(f"  auto-fetching {len(auto_urls)} top result(s)…")
+                    )
+                with ThreadPoolExecutor(
+                    max_workers=min(len(auto_urls), config.FETCH_CONCURRENCY)
+                ) as executor:
+                    fetch_futures = {
+                        executor.submit(fetch_fn["fn"], url): url for url in auto_urls
+                    }
+                    auto_results: List[tuple[str, Any]] = []
+                    for future, url in fetch_futures.items():
+                        started_f = time.perf_counter()
+                        try:
+                            res = future.result()
+                        except Exception as exc:
+                            res = {"error": f"{type(exc).__name__}: {exc}"}
+                        auto_results.append((url, res))
+                        if verbose:
+                            logutil._print(
+                                logutil.tool_step(step, "fetch_page(auto)", _preview(res))
+                                + logutil.dim(f"  {time.perf_counter() - started_f:.1f}s")
+                            )
+                            logutil._print(logutil.tool_result(res))
 
         # Add all results to messages and check for termination.
         has_final = False
-        for call in calls:
-            name = call["tool"]
+        for call, (name, result, _, _) in zip(calls, executed):
             args = call["args"]
-            result = step_results.get(name, {"error": "missing result"})
             steps.append({"step": step, "tool": name, "args": args, "result": result})
 
             messages.append(AIMessage(content=text))
@@ -159,6 +203,17 @@ def run(
             if sentinel is not None:
                 answer = sentinel
                 has_final = True
+
+        if auto_urls:
+            for url, res in auto_results:
+                steps.append(
+                    {"step": step, "tool": "fetch_page", "args": {"url": url}, "result": res}
+                )
+                messages.append(
+                    HumanMessage(
+                        content=f"Tool result (fetch_page, auto-fetched for {url}):\n{_preview(res)}"
+                    )
+                )
 
         if has_final:
             break
@@ -181,8 +236,8 @@ def run(
             errors=errors,
         )
     )
-    logutil._print(logutil.agent(f"Answer: {answer}"))
-    logutil._print(logutil.separator())
+    logutil.log_only(logutil.agent(f"Answer: {answer}"))
+    logutil.log_only(logutil.separator())
     logutil.close_log()
 
     if history is not None:
