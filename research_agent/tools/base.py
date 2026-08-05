@@ -166,15 +166,25 @@ def count_tokens(embedder: Embeddings, text: str) -> int:
     return max(1, len(text) // 4)
 
 
+_tools: Optional[ResearchTools] = None
+_tools_lock = threading.Lock()
+
+
 def build_tools() -> ResearchTools:
-    embedder = CachingEmbeddings(create_embedder())
-    tools = ResearchTools(
-        llm=create_llm(),
-        embedder=embedder,
-        vectorstore=create_vectorstore(embedder),
-        text_splitter=create_text_splitter(),
-    )
-    return tools
+    global _tools
+    if _tools is not None:
+        return _tools
+    with _tools_lock:
+        if _tools is not None:
+            return _tools
+        embedder = CachingEmbeddings(create_embedder())
+        _tools = ResearchTools(
+            llm=create_llm(),
+            embedder=embedder,
+            vectorstore=create_vectorstore(embedder),
+            text_splitter=create_text_splitter(),
+        )
+        return _tools
 
 
 def _normalize_date_str(raw: Optional[str]) -> Optional[str]:
