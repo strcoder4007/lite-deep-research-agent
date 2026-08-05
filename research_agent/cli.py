@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import sys
-from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -17,8 +15,9 @@ from .memory import ConversationMemory
 
 
 EXAMPLE_QUERIES = [
-    "What are the new open source llms released?",
-    "Tell me about the new toyota GR GT, expected price, release date, specs",
+    "Tell me all the good tv show episodes released in the last week.",
+    "What are the new open source llms released this week?",
+    "Tell me about the new Toyota GR GT, expected price, release date, specs",
 ]
 
 
@@ -39,12 +38,15 @@ def _choose_query() -> str:
 def main() -> int:
     history = ConversationMemory()
     print(logutil.header("Lite Deep Research Agent"))
-    print(logutil.dim("  type 'quit' to exit"))
+    print(logutil.dim("  conversational mode — type 'quit' to exit"))
     print(logutil.separator())
     turn = 0
     while True:
         try:
-            query = _choose_query()
+            if turn == 0:
+                query = _choose_query()
+            else:
+                query = input(logutil.user("> ")).strip()
         except (KeyboardInterrupt, EOFError):
             print("\nGoodbye.")
             return 0
@@ -55,20 +57,13 @@ def main() -> int:
         result = run(query=query, verbose=True, history=history)
         report = result.get("answer", "")
         print()
-        print(logutil.header(f"Turn {turn} — Final Answer"))
-        print(report)
+        print(logutil.agent(""))
+        print(logutil.cyan(report))
         if result.get("errors"):
             print()
             print(logutil.error(f"Errors ({len(result['errors'])}):"))
             for err in result["errors"]:
                 print(f"  {logutil.error(err)}")
-        digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
-        reports_dir = Path("reports")
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        path = reports_dir / f"report_{digest}.txt"
-        path.write_text(report)
-        print()
-        print(logutil.success(f"Saved report to {path}"))
         print(logutil.separator())
 
 
