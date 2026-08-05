@@ -113,6 +113,17 @@ def separator() -> str:
     return dim("─" * 50)
 
 
+def box(lines: List[str], title: str = "", color: str = C.CYAN) -> str:
+    """Wrap lines in a rounded box; ``title`` sits in the top border."""
+    width = max(len(strip_ansi(line)) for line in lines)
+    inner = ["│ " + line + " " * (width - len(strip_ansi(line))) + " │" for line in lines]
+    t = _c(color, title) if title else ""
+    tlen = len(strip_ansi(t))
+    top = "╭─" + t + "─" * max(1, width + 1 - tlen) + "╮"
+    bot = "╰" + "─" * (width + 2) + "╯"
+    return "\n".join([top] + inner + [bot])
+
+
 def tool_result(result: Any) -> str:
     if isinstance(result, dict) and "error" in result:
         return red(f"  error: {result['error']}")
@@ -202,11 +213,11 @@ def preview_for_node(node: str, payload: dict) -> str:
 
 
 def tool_step(step: int, tool_name: str, preview: str, limit: int = 200) -> str:
-    """Colored per-step line for the agent loop: step N | tool=<name> | preview."""
-    header = node_label(f"step {step}") + " " + yellow(f"tool={tool_name}")
+    """Colored per-tool line for the agent loop, aligned under the step box."""
+    parts = [dim("│ "), node_label(f"step {step}"), dim(" · "), yellow(tool_name)]
     if preview:
-        header += dim(" | " + truncate(preview, limit))
-    return header
+        parts.append(dim(" · ") + truncate(preview, limit))
+    return "".join(parts)
 
 
 def stage(label: str) -> str:
@@ -221,42 +232,22 @@ def status_line(
     context_total: int,
     ttft: float = 0.0,
 ) -> str:
-    """Persistent one-line status: tok/s, tokens in/out, latency, context usage."""
+    """One-line LLM status: tok/s, tokens in/out, latency, context usage."""
     tps = tokens / elapsed if elapsed > 0 and tokens else 0.0
     out_tokens = max(tokens - prompt_tokens, 0)
     parts = [
-        dim("  ── "),
         yellow(bold(f"{tps:.1f} tok/s")),
-        dim("  ·  "),
-        magenta(f"in {abbr(prompt_tokens)}"),
-        dim("  ·  "),
-        cyan(f"out {abbr(out_tokens)}"),
-        dim("  ·  "),
-        blue(f"{elapsed:.1f}s"),
+        dim(" · "),
+        dim("in ") + magenta(f"{abbr(prompt_tokens)}"),
+        dim(" · "),
+        dim("out ") + cyan(f"{abbr(out_tokens)}"),
+        dim(" · "),
+        dim("time ") + blue(f"{elapsed:.1f}s"),
     ]
     if ttft > 0:
-        parts += [dim("  ·  "), dim("ttft ") + blue(f"{ttft:.2f}s")]
+        parts += [dim(" · "), dim("ttft ") + blue(f"{ttft:.2f}s")]
     if context_total > 0:
-        parts += [dim("  ·  "), dim("ctx ") + context_bar(prompt_tokens, context_total, width=14)]
-    return "".join(parts)
-
-
-def step_summary(step: int, llm_time: float, tool_time: float, fetch_time: float, total_time: float, tool_count: int, fetch_count: int) -> str:
-    """Return a colored one-line summary of a step's timing breakdown."""
-    parts = [
-        dim("──"),
-        magenta(bold(f" step {step} ")),
-        dim("|"),
-        cyan(f" LLM {llm_time:.1f}s"),
-        dim("|"),
-        yellow(f" tools {tool_time:.1f}s"),
-        dim("|"),
-        green(f" fetch {fetch_time:.1f}s"),
-        dim("|"),
-        bold(f" total {total_time:.1f}s"),
-        dim(f" ({tool_count} tools"),
-        dim(f" + {fetch_count} fetch)"),
-    ]
+        parts += [dim(" · "), dim("ctx ") + context_bar(prompt_tokens, context_total, width=14)]
     return "".join(parts)
 
 
@@ -274,8 +265,6 @@ def run_summary(
     """Return a colored end-of-run summary block."""
     out_tokens = max(total_tokens - prompt_tokens, 0)
     lines = [
-        "",
-        header("═══ Run Summary ═══"),
         dim("  Steps:   ") + bold(str(total_steps)),
         dim("  Time:    ") + blue(f"{total_time:.1f}s"),
     ]
@@ -305,8 +294,7 @@ def run_summary(
             lines.append(f"    {error(err)}")
     else:
         lines.append(dim("  Errors:  ") + success("none"))
-    lines.append(header("═══"))
-    return "\n".join(lines)
+    return box(lines, " Run Summary ", C.MAGENTA)
 
 
 def yaml_safe_dump(data: Any) -> str:

@@ -25,6 +25,7 @@ from .tools import (
     build_tools,
     get_tool,
     init_tools,
+    _extract_json_object,
 )
 from .tools import finalize as _finalize
 
@@ -39,6 +40,27 @@ def _preview(result: Any) -> str:
 # Search/fetch tool blocks are noise in the terminal: log them to the run
 # log only.  Errors still surface on the terminal (red line).
 QUIET_TOOLS = {"web_search", "web_search_batch", "fetch_page", "fetch_page(auto)", "fetch_page(wave2)", "fetch_pages"}
+
+# Tools that gather research material without making progress toward the
+# final answer.  Used to detect model loops that never finish.
+RESEARCH_TOOLS = {"web_search", "web_search_batch", "fetch_page", "fetch_pages", "recall_memory"}
+
+
+def _strip_tool_call(text: str) -> str:
+    """Drop a trailing JSON tool-call block (fenced or bare), keeping any
+    surrounding prose so it can still serve as the final answer."""
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+    parsed = _extract_json_object(cleaned)
+    if parsed is None:
+        return cleaned
+    start = len(cleaned)
+    for marker in ("```", "{", "["):
+        idx = cleaned.find(marker)
+        if idx != -1:
+            start = min(start, idx)
+    return cleaned[:start].strip()
 
 
 def _log_tool(step: int, name: str, result: Any, elapsed: float = 0.0) -> None:
@@ -311,6 +333,9 @@ def run(
     context_total = config.LLM_NUM_CTX
     token_budget = context_total * config.TOKEN_BUDGET_GUARD
     consecutive_error_steps = 0
+    # Rounds that returned real research material; used by the relaxed
+    # ending condition below to stop once research is done.
+    research_rounds = 0
     # Circuit breaker below reads these from the previous step, so they
     # must exist before the loop starts (step 1 included).
     auto_urls: List[str] = []
@@ -320,6 +345,31 @@ def run(
     failed_domains: set = set()
 
     for step in range(1, max_steps + 1):
+        # Relaxed ending: once enough successful research rounds have been
+        # logged, don't let the model open yet another research round — it
+        # ends the loop by writing the answer, instead of grinding through
+        # every step and dying as "stopped after N steps without a final
+        # answer" (the model rarely calls final_answer on its own).
+        if research_rounds >= config.RESEARCH_ROUND_LIMIT:
+            messages.append(HumanMessage(content=config.AGENT_FINALIZE))
+            try:
+                text, calls, info = llm.chat(messages, tools.llm, stream_final=config.STREAM_FINAL)
+            except Exception as exc:
+                errors.append(f"step {step}: llm call failed: {type(exc).__name__}: {exc}")
+                logutil._print(logutil.error(f"llm call failed: {exc}"))
+                break
+            llm_time = info["elapsed"]
+            total_time += llm_time
+            total_tokens += info["tokens"]
+            total_prompt_tokens += info["prompt_tokens"]
+            answer = text if not calls else _strip_tool_call(text)
+            answer_streamed = bool(info.get("streamed"))
+            steps.append({"step": step, "tool": None, "answer": answer})
+            if verbose:
+                preview = "(streamed above)" if answer_streamed else answer
+                logutil._print(logutil.tool_step(step, "final(text)", preview))
+            break
+
         step_started = time.perf_counter()
         llm_time = 0.0
         tool_time = 0.0
@@ -369,18 +419,30 @@ def run(
 
         # Execute all tool calls in parallel, keeping results aligned with
         # the calls (several calls to the same tool must not overwrite).
+        # tool_time is WALL time for the whole parallel batch, so it sums
+        # consistently with llm_time/fetch_time/total (the sum of the
+        # individual tool runtimes overcounds and breaks the totals).
+        tool_batch_started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=min(len(calls), config.FETCH_CONCURRENCY)) as executor:
             futures = [
                 executor.submit(_execute_tool, call["tool"], call["args"], step)
                 for call in calls
             ]
             executed = [future.result() for future in futures]
+        tool_time += time.perf_counter() - tool_batch_started
 
         for (name, result, call_errors, elapsed) in executed:
-            tool_time += elapsed
             errors.extend(call_errors)
             if verbose:
                 _log_tool(step, name, result, elapsed)
+
+        # A round with real content counts toward the research budget.
+        if any(
+            name in RESEARCH_TOOLS
+            and not (isinstance(result, dict) and "error" in result)
+            for name, result, _, _ in executed
+        ):
+            research_rounds += 1
 
         # Circuit breaker: if every tool call errored for 2 consecutive
         # steps, the model is stuck producing invalid calls — fail fast
@@ -531,13 +593,11 @@ def run(
         step_elapsed = time.perf_counter() - step_started
         if verbose:
             logutil._print(
-                logutil.step_summary(
+                memtrack.step_footer(
                     step, llm_time, tool_time, fetch_time, step_elapsed,
                     len(calls), len(auto_urls),
+                    total_prompt_tokens, context_total,
                 )
-            )
-            memtrack.print_memory_stats(
-                step, total_prompt_tokens, context_total,
             )
 
         # Add all results to messages and check for termination.

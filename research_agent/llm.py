@@ -119,7 +119,7 @@ def chat(
       - toolcalls is a list of {"tool": name, "args": {...}} (empty list if no tool call)
       - info is {"elapsed": float, "tokens": int, "prompt_tokens": int, "ttft": float}
     """
-    logutil._print(logutil.stage("llm") + " calling model ...")
+    logutil._print(logutil.stage("llm") + " calling …")
     started = time.perf_counter()
     first_token_time: Optional[float] = None
     chunks: List[str] = []
@@ -194,8 +194,8 @@ def chat(
 
     logutil._print(
         logutil.stage("llm")
-        + logutil.dim(" done")
-        + "\n"
+        + logutil.green(" done")
+        + "  "
         + logutil.status_line(elapsed, total_tokens, prompt_tokens, config.LLM_NUM_CTX, ttft)
         + (logutil.dim(" (estimated)") if estimated else "")
     )

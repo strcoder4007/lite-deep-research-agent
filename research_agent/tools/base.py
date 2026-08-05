@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import math
@@ -7,6 +8,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -297,6 +299,49 @@ def _parse_reddit_json(raw: str, url: str) -> Tuple[str, str]:
     return "\n\n".join(p for p in parts if p), title
 
 
+try:  # optional: brotli ("br") decompression; gzip/deflate always work
+    import brotli  # type: ignore
+
+    _ACCEPT_ENCODING = "gzip, deflate, br"
+except ImportError:
+    brotli = None  # type: ignore
+    _ACCEPT_ENCODING = "gzip, deflate"
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
+
+def _download_html(url: str, timeout: int) -> str:
+    """Download a URL and return the decoded HTML text.
+
+    trafilatura's own fetch_url returns the compressed body undecoded for
+    some sites, so extraction fails with "page content could not be
+    parsed".  Download ourselves with a browser UA and decompress
+    gzip/br/deflate before handing the HTML to trafilatura.
+    """
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": _ACCEPT_ENCODING,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    enc = (resp.headers.get("Content-Encoding") or "").lower()
+    if "gzip" in enc:
+        raw = gzip.decompress(raw)
+    elif "br" in enc and brotli is not None:
+        raw = brotli.decompress(raw)
+    elif "deflate" in enc:
+        raw = zlib.decompress(raw)
+    return raw.decode("utf-8", errors="replace")
+
+
 @traceable(run_type="retriever", name="Fetch URL")
 def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple[str, str]]:
     if config.FETCH_CACHE_TTL > 0:
@@ -323,19 +368,17 @@ def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple
             return ("error", f"network error: {type(exc).__name__}: {exc}")
 
     try:
-        dl_config = trafilatura.settings.use_config()
-        dl_config.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(timeout))
-        downloaded = trafilatura.fetch_url(url, config=dl_config)
+        html = _download_html(url, timeout)
     except Exception as exc:
         return ("error", f"network error: {type(exc).__name__}: {exc}")
 
-    if not downloaded:
+    if not html or not html.strip():
         return ("error", "no content downloaded (empty response or blocked by server)")
 
     text = trafilatura.extract(
-        downloaded,
+        html,
         output_format="markdown",
-        favor_precision=True,
+        favor_precision=False,
         include_comments=False,
         include_tables=False,
     )
@@ -344,7 +387,7 @@ def fetch_url(url: str, timeout: int = config.REQUEST_TIMEOUT) -> Optional[Tuple
 
     if len(text) > config.MAX_PAGE_CHARS:
         text = text[: config.MAX_PAGE_CHARS]
-    metadata = trafilatura.extract_metadata(downloaded)
+    metadata = trafilatura.extract_metadata(html)
     title = (metadata.title.strip() if metadata and metadata.title else None) or url
     return (title, text)
 

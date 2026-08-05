@@ -67,6 +67,12 @@ MEMORY_SIMILARITY_THRESHOLD = float(os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.
 TOKEN_BUDGET_GUARD = float(os.getenv("TOKEN_BUDGET_GUARD", "0.8"))
 # Agent loop (custom tool-calling loop in agent.py)
 MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "6"))
+# After this many rounds whose search/fetch tools actually returned content,
+# stop letting the model open another research round and force it to write the
+# final answer. Weak models otherwise keep chaining search/fetch rounds until
+# MAX_AGENT_STEPS and the run dies as "stopped after N steps without a final
+# answer". 0 disables (runs the full step budget).
+RESEARCH_ROUND_LIMIT = int(os.getenv("RESEARCH_ROUND_LIMIT", "2"))
 # After web_search results arrive, fetch this many top URLs automatically
 # (in parallel, no extra model call). 0 disables auto-fetch.
 AUTO_FETCH_TOP_N = int(os.getenv("AUTO_FETCH_TOP_N", "3"))
@@ -215,6 +221,13 @@ PREFERRED_DOMAINS: list[str] = [
 ]
 # Nudge appended once when the model returns empty/degenerate output.
 AGENT_NUDGE = "Output only the JSON tool call or your final answer."
+
+# Directive appended when RESEARCH_ROUND_LIMIT is reached: end the loop by
+# writing the answer instead of opening yet another research round.
+AGENT_FINALIZE = (
+    "Research is complete. You now have enough material to answer. "
+    "Write the final answer as plain text. Do NOT call any tools."
+)
 
 # Digest old tool results: after this many steps, compress older
 # tool-result messages into one-line digests to save prompt tokens.
