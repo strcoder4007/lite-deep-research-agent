@@ -43,5 +43,23 @@ MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "5000"))
 
 # Agent loop (custom tool-calling loop in agent.py)
 MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "12"))
+# After web_search results arrive, fetch this many top URLs automatically
+# (in parallel, no extra model call). 0 disables auto-fetch.
+AUTO_FETCH_TOP_N = int(os.getenv("AUTO_FETCH_TOP_N", "6"))
+AUTO_FETCH_MAX_TOTAL = int(os.getenv("AUTO_FETCH_MAX_TOTAL", "14"))
+# Domains to skip during auto-fetch (trafilatura can't extract content
+# from these or they block automated access).
+AUTO_FETCH_SKIP_DOMAINS: list[str] = [
+    "google.com",
+    "youtube.com",
+    "youtu.be",
+    "facebook.com",
+    "x.com",
+    "twitter.com",
+    "instagram.com",
+    "tiktok.com",
+    "linkedin.com",
+    "reddit.com",
+]
 # Nudge appended once when the model returns empty/degenerate output.
 AGENT_NUDGE = "Output only the JSON tool call or your final answer."

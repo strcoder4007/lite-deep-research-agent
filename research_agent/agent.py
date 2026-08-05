@@ -92,7 +92,7 @@ def run(
 
     for step in range(1, max_steps + 1):
         started = time.perf_counter()
-        text, calls, info = llm.stream_chat(messages, tools.llm)
+        text, calls, info = llm.chat(messages, tools.llm)
         total_time += info["elapsed"]
         total_tokens += info["tokens"]
         total_prompt_tokens += info["prompt_tokens"]
@@ -100,7 +100,7 @@ def run(
         # Nudge retry once on empty/degenerate output (HLD §13.16 pattern).
         if not text.strip() and not calls:
             messages.append(HumanMessage(content=config.AGENT_NUDGE))
-            text, nudge_calls, nudge_info = llm.stream_chat(messages, tools.llm)
+            text, nudge_calls, nudge_info = llm.chat(messages, tools.llm)
             total_time += nudge_info["elapsed"]
             total_tokens += nudge_info["tokens"]
             total_prompt_tokens += nudge_info["prompt_tokens"]
@@ -150,9 +150,15 @@ def run(
                     continue
                 for item in result[: config.AUTO_FETCH_TOP_N]:
                     url = item.get("url") if isinstance(item, dict) else None
+                    if not url:
+                        continue
+                    from urllib.parse import urlparse
+
+                    domain = urlparse(url).netloc.lower()
+                    if any(skip in domain for skip in config.AUTO_FETCH_SKIP_DOMAINS):
+                        continue
                     if (
-                        url
-                        and url not in fetched_urls
+                        url not in fetched_urls
                         and url not in auto_urls
                         and len(auto_urls) < config.AUTO_FETCH_MAX_TOTAL
                     ):
