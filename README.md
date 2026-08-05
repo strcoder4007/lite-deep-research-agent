@@ -125,6 +125,8 @@ REQUEST_TIMEOUT=12
 
 # Agent loop
 MAX_AGENT_STEPS=12            # max tool-call turns per run
+AUTO_FETCH_TOP_N=6            # top search hits fetched automatically (no extra LLM call)
+AUTO_FETCH_MAX_TOTAL=14       # cap on auto-fetched pages per step
 
 # Memory
 MEMORY_DIR=advanced_memory

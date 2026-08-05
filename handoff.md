@@ -84,6 +84,10 @@ lite-deep-research-agent/
      (bad args) and other exceptions are caught and fed back to the model as
      the tool result. `final_answer` (or its sentinel) ends the loop.
 3. Per-step logging via `logutil.tool_step`: `step N | tool=<name> | preview`.
+   After any `web_search`, the top `AUTO_FETCH_TOP_N` URLs per search are
+   fetched automatically in parallel (no extra model call) and appended as
+   tool results — the fast research path is: batched searches → auto-fetch →
+   final answer (~2 LLM calls).
 4. Returns `{query, answer, steps, errors}`.
 
 ### Tool-call format

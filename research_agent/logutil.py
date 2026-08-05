@@ -28,6 +28,13 @@ def _print(msg: str) -> None:
         _log_file.flush()
 
 
+def log_only(msg: str) -> None:
+    """Write to the log file without printing to the terminal."""
+    if _log_file is not None:
+        _log_file.write(strip_ansi(msg) + "\n")
+        _log_file.flush()
+
+
 def _c(code: str, text: str) -> str:
     if not _USE_COLOR:
         return text
@@ -206,6 +213,27 @@ def tool_step(step: int, tool_name: str, preview: str, limit: int = 200) -> str:
 def stage(label: str) -> str:
     """Return a colored stage indicator."""
     return cyan(f"[{label}]")
+
+
+def status_line(
+    elapsed: float,
+    tokens: int,
+    prompt_tokens: int,
+    context_total: int,
+) -> str:
+    """Persistent one-line status: tok/s, tokens, latency, context usage."""
+    tps = tokens / elapsed if elapsed > 0 and tokens else 0.0
+    parts = [
+        dim("  ── "),
+        yellow(bold(f"{tps:.1f} tok/s")),
+        dim("  ·  "),
+        cyan(f"{abbr(tokens)} tok"),
+        dim("  ·  "),
+        blue(f"{elapsed:.1f}s"),
+    ]
+    if context_total > 0:
+        parts += [dim("  ·  "), dim("ctx ") + context_bar(prompt_tokens, context_total, width=14)]
+    return "".join(parts)
 
 
 def run_summary(
