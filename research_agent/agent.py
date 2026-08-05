@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +33,24 @@ def _preview(result: Any) -> str:
         return json.dumps(result, ensure_ascii=False, default=str)
     except Exception:
         return str(result)
+
+
+def _for_message(result: Any) -> str:
+    """Render a tool result for the message history, truncating page text.
+
+    Fetched pages can be MAX_PAGE_CHARS long; appending several verbatim
+    makes the next prompt huge (prompt tokens are the dominant cost and
+    can push the LLM call past the client timeout).  The full result is
+    still kept in ``steps`` and passed to the tools themselves.
+    """
+    if isinstance(result, dict) and isinstance(result.get("text"), str):
+        text = result["text"]
+        if len(text) > config.MESSAGE_PAGE_CHARS:
+            result = {
+                **result,
+                "text": text[: config.MESSAGE_PAGE_CHARS] + "…[truncated]",
+            }
+    return _preview(result)
 
 
 def _execute_tool(
@@ -88,20 +106,40 @@ def run(
     total_tokens = 0
     total_prompt_tokens = 0
     total_time = 0.0
+    total_tool_time = 0.0
+    total_fetch_time = 0.0
     context_total = config.LLM_NUM_CTX
 
     for step in range(1, max_steps + 1):
-        started = time.perf_counter()
-        text, calls, info = llm.chat(messages, tools.llm)
-        total_time += info["elapsed"]
+        step_started = time.perf_counter()
+        llm_time = 0.0
+        tool_time = 0.0
+        fetch_time = 0.0
+        try:
+            text, calls, info = llm.chat(messages, tools.llm)
+        except Exception as exc:
+            # Timeout / connection failure: fail the run fast instead of
+            # hanging (the openai client's internal retries already ran).
+            errors.append(f"step {step}: llm call failed: {type(exc).__name__}: {exc}")
+            logutil._print(logutil.error(f"llm call failed: {exc}"))
+            break
+        llm_time = info["elapsed"]
+        total_time += llm_time
         total_tokens += info["tokens"]
         total_prompt_tokens += info["prompt_tokens"]
 
         # Nudge retry once on empty/degenerate output (HLD §13.16 pattern).
         if not text.strip() and not calls:
             messages.append(HumanMessage(content=config.AGENT_NUDGE))
-            text, nudge_calls, nudge_info = llm.chat(messages, tools.llm)
-            total_time += nudge_info["elapsed"]
+            try:
+                text, nudge_calls, nudge_info = llm.chat(messages, tools.llm)
+            except Exception as exc:
+                errors.append(f"step {step}: llm call failed: {type(exc).__name__}: {exc}")
+                logutil._print(logutil.error(f"llm call failed: {exc}"))
+                break
+            nudge_llm_time = nudge_info["elapsed"]
+            llm_time += nudge_llm_time
+            total_time += nudge_llm_time
             total_tokens += nudge_info["tokens"]
             total_prompt_tokens += nudge_info["prompt_tokens"]
             if not text.strip() and not nudge_calls:
@@ -145,17 +183,27 @@ def run(
         }
         auto_urls: List[str] = []
         if config.AUTO_FETCH_TOP_N > 0:
+            from urllib.parse import urlparse
+
+            def _skipped(url: str) -> bool:
+                domain = urlparse(url).netloc.lower()
+                return any(skip in domain for skip in config.AUTO_FETCH_SKIP_DOMAINS)
+
             for call, (name, result, _, _) in zip(calls, executed):
                 if name != "web_search" or not isinstance(result, list):
                     continue
-                for item in result[: config.AUTO_FETCH_TOP_N]:
-                    url = item.get("url") if isinstance(item, dict) else None
-                    if not url:
-                        continue
-                    from urllib.parse import urlparse
-
-                    domain = urlparse(url).netloc.lower()
-                    if any(skip in domain for skip in config.AUTO_FETCH_SKIP_DOMAINS):
+                top = [i for i in result[: config.AUTO_FETCH_TOP_N] if isinstance(i, dict) and i.get("url")]
+                if not top:
+                    continue
+                # Quality gate: if most top hits are skip-domains (YouTube,
+                # social, …), this search has no fetchable content — skip it.
+                if sum(1 for i in top if _skipped(i["url"])) > len(top) / 2:
+                    if verbose:
+                        logutil._print(logutil.dim("  auto-fetch skipped (low-quality results)"))
+                    continue
+                for item in top:
+                    url = item["url"]
+                    if _skipped(url):
                         continue
                     if (
                         url not in fetched_urls
@@ -170,17 +218,24 @@ def run(
                     logutil._print(
                         logutil.dim(f"  auto-fetching {len(auto_urls)} top result(s)…")
                     )
-                with ThreadPoolExecutor(
+                # Not a `with` block: shutdown(wait=False) so a hung fetch
+                # thread can't block the run after we time it out.
+                executor = ThreadPoolExecutor(
                     max_workers=min(len(auto_urls), config.FETCH_CONCURRENCY)
-                ) as executor:
-                    fetch_futures = {
-                        executor.submit(fetch_fn["fn"], url): url for url in auto_urls
-                    }
-                    auto_results: List[tuple[str, Any]] = []
+                )
+                fetch_futures = {
+                    executor.submit(fetch_fn["fn"], url): url for url in auto_urls
+                }
+                auto_results: List[tuple[str, Any]] = []
+                try:
                     for future, url in fetch_futures.items():
                         started_f = time.perf_counter()
                         try:
-                            res = future.result()
+                            # Hard cap: trafilatura's own timeout is not always
+                            # honored, so enforce one around the future.
+                            res = future.result(timeout=config.REQUEST_TIMEOUT + 10)
+                        except FuturesTimeoutError:
+                            res = {"error": f"fetch timed out after {config.REQUEST_TIMEOUT + 10}s"}
                         except Exception as exc:
                             res = {"error": f"{type(exc).__name__}: {exc}"}
                         auto_results.append((url, res))
@@ -190,6 +245,17 @@ def run(
                                 + logutil.dim(f"  {time.perf_counter() - started_f:.1f}s")
                             )
                             logutil._print(logutil.tool_result(res))
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
+
+        step_elapsed = time.perf_counter() - step_started
+        if verbose:
+            logutil._print(
+                logutil.step_summary(
+                    step, llm_time, tool_time, fetch_time, step_elapsed,
+                    len(calls), len(auto_urls),
+                )
+            )
 
         # Add all results to messages and check for termination.
         has_final = False
@@ -199,7 +265,7 @@ def run(
 
             messages.append(AIMessage(content=text))
             messages.append(
-                HumanMessage(content=f"Tool result ({name}):\n{_preview(result)}")
+                HumanMessage(content=f"Tool result ({name}):\n{_for_message(result)}")
             )
 
             if name == "final_answer":
@@ -217,7 +283,7 @@ def run(
                 )
                 messages.append(
                     HumanMessage(
-                        content=f"Tool result (fetch_page, auto-fetched for {url}):\n{_preview(res)}"
+                        content=f"Tool result (fetch_page, auto-fetched for {url}):\n{_for_message(res)}"
                     )
                 )
 
@@ -235,6 +301,8 @@ def run(
     logutil._print(logutil.run_summary(
             total_steps=len(steps),
             total_time=total_time,
+            total_tool_time=total_tool_time,
+            total_fetch_time=total_fetch_time,
             total_tokens=total_tokens,
             prompt_tokens=total_prompt_tokens,
             context_used=context_used,

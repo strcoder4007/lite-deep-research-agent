@@ -236,9 +236,30 @@ def status_line(
     return "".join(parts)
 
 
+def step_summary(step: int, llm_time: float, tool_time: float, fetch_time: float, total_time: float, tool_count: int, fetch_count: int) -> str:
+    """Return a colored one-line summary of a step's timing breakdown."""
+    parts = [
+        dim("──"),
+        magenta(bold(f" step {step} ")),
+        dim("|"),
+        cyan(f" LLM {llm_time:.1f}s"),
+        dim("|"),
+        yellow(f" tools {tool_time:.1f}s"),
+        dim("|"),
+        green(f" fetch {fetch_time:.1f}s"),
+        dim("|"),
+        bold(f" total {total_time:.1f}s"),
+        dim(f" ({tool_count} tools"),
+        dim(f" + {fetch_count} fetch)"),
+    ]
+    return "".join(parts)
+
+
 def run_summary(
     total_steps: int,
     total_time: float,
+    total_tool_time: float,
+    total_fetch_time: float,
     total_tokens: int,
     prompt_tokens: int,
     context_used: int,
@@ -252,6 +273,10 @@ def run_summary(
         f"  Steps:           {total_steps}",
         f"  Total time:      {total_time:.1f}s",
     ]
+    if total_tool_time > 0:
+        lines.append(f"  Tool time:       {total_tool_time:.1f}s")
+    if total_fetch_time > 0:
+        lines.append(f"  Auto-fetch time: {total_fetch_time:.1f}s")
     if total_tokens > 0:
         avg = total_tokens / total_time if total_time > 0 else 0
         lines.append(f"  Avg speed:       {avg:.1f} tok/s")
