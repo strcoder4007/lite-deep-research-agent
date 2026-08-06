@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from .. import config
@@ -14,31 +13,40 @@ _CACHE: Dict[Tuple[str, int, int, Optional[str]], Tuple[float, List[Dict[str, st
 
 
 def _detect_time_sensitive(query: str) -> Tuple[int, Optional[str]]:
+    """Infer the recency window the query implies, or (0, None) if it
+    doesn't ask for fresher results."""
     q = query.strip().lower()
-    now = datetime.utcnow()
 
-    if any(kw in q for kw in ["this week", "this month", "last 7 days", "past week"]):
-        return 7, None
-    if any(kw in q for kw in ["last month", "past 30 days"]):
-        return 30, None
-    if any(kw in q for kw in ["last year", "past year", "this year"]):
-        return 365, None
-    if any(kw in q for kw in ["yesterday", "today", "last 24 hours", "past day"]):
+    # Explicit windows win over vague recency words.
+    if any(kw in q for kw in ["last 24 hours", "past day", "past 24 hours", "today", "yesterday"]):
         return 1, None
-    if any(kw in q for kw in ["last week", "past 7 days"]):
+    if any(kw in q for kw in ["this week", "last week", "last 7 days", "past week", "past 7 days"]):
         return 7, None
+    if any(kw in q for kw in ["this month", "last month", "past 30 days", "last 30 days"]):
+        return 30, None
+    if any(kw in q for kw in ["last year", "past year", "this year", "past 365 days"]):
+        return 365, None
 
-    # Check for explicit date references like "released in August 2026"
-    for kw in ["released this", "new this", "announced this", "launched this"]:
-        if kw in q:
-            return 7, None
+    # Vague recency signals ("latest", "recent", "current", "newest",
+    # "up to date", "as of now", "any news on") default to the past week.
+    if any(kw in q for kw in [
+        "latest", "recent", "newest", "breaking", "current",
+        "updated", "up to date", "as of now", "right now",
+        "what's new", "whats new", "any news", "news on",
+        "new version", "new release", "released", "announced",
+        "launched", "unveiled",
+    ]):
+        return 7, None
 
     return 0, None
 
 
 def _search_cached(query: str, max_results: int, since_days: int = 0, time_limit: Optional[str] = None) -> List[Dict[str, str]]:
     key = (query.strip().lower(), max_results, since_days, time_limit)
-    if config.SEARCH_CACHE_TTL > 0:
+    # Recency-filtered queries must never be served from cache: "the
+    # latest X" has a short shelf life and cached hits go stale fast.
+    cached_ok = config.SEARCH_CACHE_TTL > 0 and since_days == 0 and time_limit is None
+    if cached_ok:
         hit = _CACHE.get(key)
         if hit and time.time() - hit[0] < config.SEARCH_CACHE_TTL:
             return hit[1]
@@ -46,7 +54,8 @@ def _search_cached(query: str, max_results: int, since_days: int = 0, time_limit
         {"url": r["url"], "title": r["title"], "snippet": r["snippet"]}
         for r in run_ddg_search(query, max_results=max_results, since_days=since_days, time_limit=time_limit)
     ]
-    _CACHE[key] = (time.time(), results)
+    if cached_ok:
+        _CACHE[key] = (time.time(), results)
     return results
 
 

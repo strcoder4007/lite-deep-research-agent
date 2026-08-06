@@ -219,6 +219,19 @@ def _normalize_date_str(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def _days_to_timelimit(since_days: int) -> Optional[str]:
+    """Map a `since_days` window to the DDG timelimit filter it implies."""
+    if since_days <= 0:
+        return None
+    if since_days <= 1:
+        return "d"
+    if since_days <= 7:
+        return "w"
+    if since_days <= 30:
+        return "m"
+    return "y"
+
+
 def _inject_date_filters(query: str, since_days: int = 0, date_from: Optional[str] = None, date_to: Optional[str] = None) -> str:
     tokens = []
     if since_days > 0 and not date_from:
@@ -242,19 +255,28 @@ def run_ddg_search(
     date_to: Optional[str] = None,
     time_limit: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    search_query = _inject_date_filters(query, since_days=since_days, date_from=date_from, date_to=date_to)
+    # A `since_days` window only takes effect through the real DDG time
+    # filter (timelimit); an "after:" operator in the query text is
+    # ignored by DDG and leaves the search unfiltered (stale results).
+    effective_limit = time_limit or _days_to_timelimit(since_days)
+    search_query = _inject_date_filters(
+        query,
+        since_days=0 if effective_limit else since_days,
+        date_from=date_from,
+        date_to=date_to,
+    )
     search = _get_ddg_session()
-    if time_limit:
+    if effective_limit:
         results = list(
-            search.news(
+            search.text(
+                search_query,
                 safesearch="off",
-                keywords=search_query,
-                timelimit=time_limit,
+                timelimit=effective_limit,
                 max_results=max_results,
             )
         )
     else:
-        results = list(search.text(search_query, max_results=max_results))
+        results = list(search.text(search_query, safesearch="off", max_results=max_results))
     cleaned = []
     for item in results:
         url = item.get("href") or item.get("url")

@@ -2,6 +2,8 @@
 
 ![Tiny Deep Researcher](tiny-deep-researcher.png)
 
+![Agent](agent.png)
+
 General-purpose local agent with a **decorated tool registry** and a custom,
 lightweight tool-calling loop (no LangGraph). The model answers questions by
 calling tools — web search, page fetch, long-term memory — one JSON tool call
